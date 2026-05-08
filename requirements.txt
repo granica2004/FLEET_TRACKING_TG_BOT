@@ -1,34 +1,33 @@
 # Telegram Bot
-aiogram==3.4.1
-aiohttp==3.9.3
+aiogram>=3.4.1
+aiohttp>=3.9.0
 
 # Web Framework
-fastapi==0.109.2
-uvicorn[standard]==0.27.1
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
 
 # Database
-sqlalchemy[asyncio]==2.0.25
-asyncpg==0.29.0
-alembic==1.13.1
+sqlalchemy[asyncio]>=2.0.25
+asyncpg>=0.29.0
+alembic>=1.13.0
 
 # Redis (FSM storage + caching)
-redis==5.0.1
-aioredis==2.0.1
+redis>=5.0.0
 
 # Scheduler
-apscheduler==3.10.4
+apscheduler>=3.10.4
 
-# Geocoding & Maps
-httpx==0.26.0
+# HTTP client for geocoding
+httpx>=0.26.0
 
 # Environment & Config
-python-dotenv==1.0.1
-pydantic==2.6.1
-pydantic-settings==2.1.0
+python-dotenv>=1.0.0
+pydantic>=2.4.1,<2.6
+pydantic-settings>=2.1.0
 
 # Utilities
-python-dateutil==2.8.2
-pytz==2024.1
+python-dateutil>=2.8.0
+pytz>=2024.1
 
 # Logging
-loguru==0.7.2
+loguru>=0.7.0
