@@ -15,7 +15,7 @@ settings = get_settings()
 # Создаём асинхронный движок
 # NullPool рекомендуется для asyncio приложений
 engine = create_async_engine(
-    settings.database_url,
+    settings.async_database_url,
     echo=settings.app_debug,
     poolclass=NullPool,
 )
