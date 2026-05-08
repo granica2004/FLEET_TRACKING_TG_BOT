@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     
     # === База данных ===
     database_url: str = Field(..., env="DATABASE_URL")
+
+    @property
+    def async_database_url(self) -> str:
+        """Convert DATABASE_URL to async-compatible URL for asyncpg."""
+        url = self.database_url
+        if url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        elif url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+        return url
     
     # === Redis ===
     redis_url: str = Field("redis://localhost:6379/0", env="REDIS_URL")
@@ -51,7 +61,7 @@ class Settings(BaseSettings):
     app_env: str = Field("development", env="APP_ENV")
     app_debug: bool = Field(False, env="APP_DEBUG")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
-    app_port: int = Field(8000, env="APP_PORT")
+    app_port: int = Field(8000, env="PORT")
     
     # === Расписание ===
     daily_location_request_hour: int = Field(5, env="DAILY_LOCATION_REQUEST_HOUR")  # UTC (8:00 МСК)
