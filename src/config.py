@@ -39,10 +39,10 @@ bitrix_final_stages: list[str] = Field(
 )
     
     # === Геокодирование (LocationIQ - бесплатно 5000 req/day) ===
-    locationiq_api_key: str = Field("", env="LOCATIONIQ_API_KEY")
+        locationiq_api_key: str = Field("", env="LOCATIONIQ_API_KEY")
     
     # === База данных ===
-    database_url: str = Field(..., env="DATABASE_URL")
+        database_url: str = Field(..., env="DATABASE_URL")
 
     @property
     def async_database_url(self) -> str:
