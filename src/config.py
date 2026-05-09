@@ -30,13 +30,13 @@ class Settings(BaseSettings):
     bitrix_field_telegram_id: str = Field("UF_CRM_66365540E721C", env="BITRIX_FIELD_TELEGRAM_ID")
     bitrix_field_telegram_group: str = Field("UF_CRM_A_T_GROUP_ID", env="BITRIX_FIELD_TELEGRAM_GROUP")
     
-    # Стадии сделки (нужно уточнить реальные ID)
-    bitrix_stage_cargo_sent: str = Field("UC_CARGO_SENT", env="BITRIX_STAGE_CARGO_SENT")
-    bitrix_stage_cargo_arrived: str = Field("UC_CARGO_ARRIVED", env="BITRIX_STAGE_CARGO_ARRIVED")
-    bitrix_final_stages: list[str] = Field(
-        default=["WON", "LOSE", "FINAL"],
-        env="BITRIX_FINAL_STAGES"
-    )
+    # Стадии сделки
+bitrix_stage_cargo_sent: str = Field("UC_SDO64X", env="BITRIX_STAGE_CARGO_SENT")
+bitrix_stage_cargo_arrived: str = Field("9", env="BITRIX_STAGE_CARGO_ARRIVED")
+bitrix_final_stages: list[str] = Field(
+    default=["WON", "9", "UC_9G2PZA"],
+    env="BITRIX_FINAL_STAGES"
+)
     
     # === Геокодирование (LocationIQ - бесплатно 5000 req/day) ===
     locationiq_api_key: str = Field("", env="LOCATIONIQ_API_KEY")
