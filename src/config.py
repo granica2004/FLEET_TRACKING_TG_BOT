@@ -82,6 +82,7 @@ class Settings(BaseSettings):
 
 
 # Справочник терминалов
+# Ключи — ID из enumeration поля UF_CRM_1711445194523 в Битрикс24
 TERMINALS = {
     "86": {
         "code": "Коломна",
@@ -94,6 +95,51 @@ TERMINALS = {
         "google_maps": "https://goo.gl/maps/6Pb4oeUxTBrcSTWq5",
         "yandex_maps": "https://yandex.ru/maps/-/CCUaBMf4lD",
     },
+    "302": {
+        "code": "Новосибирск",
+        "name_en": 'TSH of Legion Siberia Plus LLC',
+        "name_ru": 'СВХ ООО "Легион Сибирь Плюс"',
+        "address_en": "Tolmachevskaya St., 1, Building 1, Novosibirsk, Russia",
+        "address_ru": "Россия, г. Новосибирск, ул. Толмачевская, д. 1/1",
+        "lat": 54.964168,
+        "lon": 82.828388,
+        "google_maps": "https://maps.app.goo.gl/J2KGaeTEWYK4ypGu6",
+        "yandex_maps": "https://yandex.ru/maps/-/CPcreXmD",
+    },
+    "306": {
+        "code": "Оренбург",
+        "name_en": 'THW URALCOMPLECT LLC',
+        "name_ru": 'СВХ ООО "УРАЛКОМПЛЕКТ"',
+        "address_en": "Russia, Orenburg, st. Donguzskaya, building 62A",
+        "address_ru": "Россия, г. Оренбург, ул. Донгузская, зд. 62А",
+        "lat": 51.694992,
+        "lon": 55.098562,
+        "google_maps": "https://maps.app.goo.gl/8fqcDJ8kWqyQqbQR8",
+        "yandex_maps": "https://yandex.ru/maps/-/CPcrBJ64",
+    },
+    "308": {
+        "code": "Ростов",
+        "name_en": 'TSW of Southern Transport Lines LLC',
+        "name_ru": 'СВХ ООО "Южные Транспортные Линии"',
+        "address_en": "Russia, Rostov region, Novoshakhtinsk, Privolnaya street, 31",
+        "address_ru": "Россия, Ростовская обл., г. Новошахтинск, ул. Привольная, д. 31",
+        "lat": 47.783347,
+        "lon": 39.894545,
+        "google_maps": "https://maps.app.goo.gl/oZbZfJt2U2maFZCNA",
+        "yandex_maps": "https://yandex.ru/maps/-/CPcrNL5d",
+    },
+    # TODO: Добавить остальные терминалы
+    # "88": {"code": "Михнево", ...},
+    # "90": {"code": "Новороссийск", ...},
+    # "98": {"code": "Астрахань", ...},
+    # "108": {"code": "Ворсино", ...},
+    # "128": {"code": "Электроугли", ...},
+    # "178": {"code": "СПБ", ...},
+    # "180": {"code": "Селятино", ...},
+    # "274": {"code": "Дербент", ...},
+    # "276": {"code": "Белый Раст", ...},
+    # "300": {"code": "Екатеринбург", ...},
+    # "310": {"code": "Казань", ...},
 }
 
 
