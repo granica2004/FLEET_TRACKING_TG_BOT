@@ -65,6 +65,21 @@ def _admin_kb():
     return trip_button, driver_reply_button
 
 
+CONSENT_TEXT = (
+    "🚛 <b>Бот отслеживания перевозок ГРАНИЦА 2004</b>\n\n"
+    "Бот передаёт местоположение машины на пути к таможенному терминалу.\n\n"
+    "Для работы нужно ваше согласие: координаты и адрес вашей машины во время рейса увидят "
+    "таможенный брокер, отправитель груза и получатель груза. Данные используются только "
+    "для контроля доставки и передаются только во время активного рейса.\n\n"
+    "Нажмите кнопку ниже, если согласны:"
+)
+
+
+async def send_consent_request(message: Message, state: FSMContext):
+    await message.answer(CONSENT_TEXT, reply_markup=keyboards.consent_keyboard(), parse_mode="HTML")
+    await state.set_state(RegistrationStates.waiting_consent)
+
+
 # ==================== КОМАНДА /start ====================
 
 @router.message(Command("start"))
@@ -113,21 +128,7 @@ async def cmd_start(message: Message, state: FSMContext):
                     last_name=message.from_user.last_name,
                 )
             
-            await message.answer(
-                "🚛 <b>Бот отслеживания перевозок</b>\n\n"
-                "Добро пожаловать! Этот бот помогает отслеживать местоположение груза "
-                "на пути к таможенному терминалу.\n\n"
-                "Для работы необходимо ваше согласие на передачу данных о местоположении. "
-                "Данные используются исключительно для мониторинга доставки груза и будут "
-                "переданы таможенному брокеру.\n\n"
-                "Нажмите кнопку ниже, если согласны:",
-                reply_markup=keyboards.consent_keyboard(),
-                parse_mode="HTML"
-            )
-            await state.set_state(RegistrationStates.waiting_consent)
-    
-    if is_admin(message.from_user.id):
-        await message.answer("🛠 Вы админ: панель управления — /admin")
+            await send_consent_request(message, state)
 
 
 # ==================== СОГЛАСИЕ ====================
@@ -136,13 +137,25 @@ async def cmd_start(message: Message, state: FSMContext):
 async def process_consent(message: Message, state: FSMContext):
     """Обработка согласия на передачу геолокации"""
     
+    data = await state.get_data()
     async with get_session() as session:
-        await crud.update_driver_consent(session, message.from_user.id, True)
+        driver = await crud.update_driver_consent(session, message.from_user.id, True)
+        # Водитель пришёл по ссылке на конкретный рейс — подключаем сразу
+        if data.get("invite_trip_id") and driver:
+            from src.bot.roles import attach_driver, driver_trip_text
+            trip = await crud.get_trip_by_id(session, data["invite_trip_id"])
+            if trip and trip.status == "active":
+                await attach_driver(session, message.bot, driver, trip)
+                text = await driver_trip_text(trip)
+                await state.set_state(RegistrationStates.active_trip)
+                await state.update_data(invite_trip_id=None)
+                await message.answer(text, reply_markup=keyboards.location_keyboard(), parse_mode="HTML")
+                return
     
     await message.answer(
         "✅ Согласие получено! Спасибо.\n\n"
         "Теперь введите <b>номер тягача</b> (без пробелов):\n"
-        "Например: А123ВС77 или 60144OBA",
+        "Например: А123ВС77 или 60144OBA. Если везёте контейнер — можно номер контейнера.",
         reply_markup=keyboards.cancel_keyboard(),
         parse_mode="HTML"
     )
@@ -185,6 +198,26 @@ async def process_truck_number(message: Message, state: FSMContext):
             session, message.from_user.id, truck, None
         )
         
+        # Рейс с этим номером уже создан брокером/админом и ждёт водителя
+        prepared = await crud.get_driverless_trip_by_truck(session, truck)
+        if prepared:
+            from src.bot.roles import attach_driver, driver_trip_text
+            await attach_driver(session, message.bot, driver, prepared)
+            if not prepared.bitrix_deal_id:
+                try:
+                    found = await bitrix_client.find_deal_by_truck_number(truck)
+                except Exception as e:
+                    logger.error(f"Bitrix search failed: {e}")
+                    found = None
+                if found:
+                    apply_deal_to_trip(prepared, found)
+                    await bitrix_client.update_driver_telegram_id(int(found["ID"]), message.from_user.id,
+                                                                  message.from_user.username)
+            text = await driver_trip_text(prepared)
+            await message.answer(text, reply_markup=keyboards.location_keyboard(), parse_mode="HTML")
+            await state.set_state(RegistrationStates.active_trip)
+            return
+        
         # Ищем сделку в Битрикс24 (включая стадию "Новая")
         deal = await bitrix_client.find_deal_by_truck_number(truck)
         
@@ -210,6 +243,8 @@ async def process_truck_number(message: Message, state: FSMContext):
                 **fields,
             )
             
+            from src.services import events
+            await events.on_trip_started(session, trip)
             trip_button, _ = _admin_kb()
             fire("reg", f"🆕 <b>Водитель зарегистрировался</b>\n"
                         f"🚛 {escape(truck)} · {escape(message.from_user.full_name)}\n"
@@ -279,9 +314,10 @@ async def handle_location(message: Message, state: FSMContext):
     
     logger.info(f"Received location from {message.from_user.id}: {lat}, {lon}")
     
-    # Получаем адрес по координатам
+    # Получаем адрес и страну по координатам
+    country = None
     try:
-        address = await maps_service.reverse_geocode(lat, lon)
+        address, country = await maps_service.reverse_details(lat, lon)
     except Exception as e:
         logger.error(f"Geocoding error: {e}")
         address = None
@@ -312,6 +348,7 @@ async def handle_location(message: Message, state: FSMContext):
         
         if trip:
             trip.silence_alert_at = None
+        prev_location = await crud.get_last_trip_location(session, trip) if trip else None
         
         # Сохраняем локацию
         location = await crud.save_location(
@@ -323,6 +360,15 @@ async def handle_location(message: Message, state: FSMContext):
             trip_id=trip.id if trip else None,
             distance_to_destination=distance_info["distance_km"] if distance_info else None,
         )
+        location.country_code = (country or "").lower() or None
+        
+        # События: граница, машина у терминала
+        if trip:
+            try:
+                from src.services import events
+                await events.on_location(session, trip, location, prev_location)
+            except Exception as e:
+                logger.exception(f"Location events failed: {e}")
         
         # Если есть связь со сделкой — синхронизируем с Битрикс24
         bitrix_synced = False
@@ -400,7 +446,7 @@ async def handle_location_any_state(message: Message, state: FSMContext):
 
 # ==================== АДРЕС ТЕРМИНАЛА ====================
 
-@router.message(F.text == "🏭 Адрес терминала назначения")
+@router.message(F.text.in_(keyboards.TERMINAL_BUTTON_TEXTS))
 async def send_terminal_address(message: Message, state: FSMContext):
     """Отправка адреса терминала назначения"""
     
@@ -419,46 +465,48 @@ async def send_terminal_address(message: Message, state: FSMContext):
             )
             return
         
-        terminal = TERMINALS.get(trip.terminal_code)
+        terminal = TERMINALS.get(str(trip.terminal_code), {})
         
-        if terminal:
-            # Формируем сообщение с доступными данными
-            lines = [
-                f"🏭 <b>Терминал назначения:</b>\n",
-                f"<b>{terminal.get('name_ru', terminal.get('code', 'Терминал'))}</b>",
-                f"📍 {terminal.get('address_ru', 'Адрес не указан')}",
-            ]
-            
-            # Добавляем ссылки на карты если есть
-            if terminal.get("google_maps"):
-                lines.append(f"\n🗺️ <a href='{terminal['google_maps']}'>Google Maps</a>")
-            if terminal.get("yandex_maps"):
-                lines.append(f"🗺️ <a href='{terminal['yandex_maps']}'>Яндекс Карты</a>")
-            
-            await message.answer(
-                "\n".join(lines),
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            
-            # Отправляем точку на карте
-            if terminal.get("lat") and terminal.get("lon"):
-                await message.answer_location(
-                    latitude=terminal["lat"],
-                    longitude=terminal["lon"]
-                )
-        else:
-            await message.answer(
-                f"🏭 Терминал: <b>{trip.terminal_code}</b>\n\n"
-                f"❌ Подробная информация о терминале отсутствует в базе.\n"
-                f"Обратитесь к брокеру за уточнением.",
-                parse_mode="HTML"
+        lines = [
+            "📍 <b>Терминал прибытия</b>\n",
+            f"<b>{escape(terminal.get('code', str(trip.terminal_code)))}</b>",
+        ]
+        if terminal.get("name_ru"):
+            lines.append(escape(terminal["name_ru"]))
+        if terminal.get("address_ru"):
+            lines.append(f"🏠 {escape(terminal['address_ru'])}")
+        if terminal.get("address_en"):
+            lines.append(f"🏠 {escape(terminal['address_en'])}")
+        if terminal.get("hours"):
+            lines.append(f"🕐 {escape(terminal['hours'])}")
+        if terminal.get("phone"):
+            lines.append(f"📞 {escape(terminal['phone'])}")
+        
+        has_coords = terminal.get("lat") and terminal.get("lon")
+        if not has_coords:
+            lines.append("\n⚠️ Точный адрес терминала пока не внесён. Уточните у диспетчера — "
+                         "напишите сообщение прямо в этот чат.")
+        
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=keyboards.terminal_nav_keyboard(terminal["lat"], terminal["lon"]) if has_coords else None,
+        )
+        
+        # Точка на карте — по ней можно построить маршрут прямо в Telegram
+        if has_coords:
+            await message.answer_venue(
+                latitude=terminal["lat"],
+                longitude=terminal["lon"],
+                title=terminal.get("code", "Терминал"),
+                address=terminal.get("address_ru", ""),
             )
 
 
 # ==================== УВЕДОМИТЬ О ПРИБЫТИИ ====================
 
-@router.message(F.text == "📝 Уведомить о прибытии")
+@router.message(F.text.in_(keyboards.ARRIVAL_BUTTON_TEXTS))
 async def notify_arrival(message: Message, state: FSMContext):
     """Ручное уведомление о прибытии"""
     
@@ -587,6 +635,8 @@ async def confirm_finish_trip(callback: CallbackQuery, state: FSMContext):
                         trip.bitrix_deal_id,
                         "🏁 Водитель завершил отслеживание перевозки через бота."
                     )
+                from src.services import events
+                await events.on_finished(session, trip)
                 trip_button, _ = _admin_kb()
                 fire("done", f"🏁 <b>Водитель сам завершил рейс</b> {escape(trip.truck_number)}\n"
                              f"📋 {deal_link(trip.bitrix_deal_id, trip.bitrix_deal_title)}", trip_button(trip.id))
@@ -790,8 +840,8 @@ async def cmd_help(message: Message):
         "/help — Справка\n\n"
         "<b>Кнопки:</b>\n"
         "📍 Отправить местоположение — передать геолокацию\n"
-        "🏭 Адрес терминала — показать адрес назначения\n"
-        "📝 Уведомить о прибытии — указать дату прибытия\n"
+        "📍 Терминал прибытия — адрес, точка на карте и маршрут в навигаторе\n"
+        "📝 Дата прибытия — указать планируемую дату прибытия\n"
         "🔄 Новая перевозка — начать новый рейс\n"
         "❌ Завершить текущую — завершить отслеживание\n\n"
         "По вопросам обращайтесь к диспетчеру.",
@@ -819,7 +869,8 @@ async def forward_to_dispatcher(message: Message, state: FSMContext):
     if trip:
         trip_info = f"\n🚛 {escape(trip.truck_number)} · {deal_link(trip.bitrix_deal_id, trip.bitrix_deal_title)}"
     from src.services.trips import driver_label
-    for admin_id in settings.admin_ids:
+    from src.services.access import all_admin_ids
+    for admin_id in all_admin_ids():
         try:
             await message.bot.send_message(
                 admin_id,

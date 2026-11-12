@@ -23,6 +23,9 @@ from src.api import router as api_router, set_bot_and_dispatcher
 from src.services.scheduler import start_scheduler, stop_scheduler, set_bot_instance
 from src.services.notify import set_notify_bot
 from src.bot.admin import router as admin_router
+from src.bot.roles import router as roles_router
+from src.services.access import reload_admins
+from src.db.database import get_session
 
 # Конфигурация
 settings = get_settings()
@@ -72,6 +75,8 @@ async def lifespan(app: FastAPI):
     
     # Инициализация базы данных
     await init_db()
+    async with get_session() as session:
+        await reload_admins(session)
     logger.info("Database initialized")
     
     # Создание бота
@@ -91,6 +96,7 @@ async def lifespan(app: FastAPI):
     
     dp = Dispatcher(storage=storage)
     dp.include_router(admin_router)  # раньше основного: /admin и шаги админа важнее шагов водителя
+    dp.include_router(roles_router)  # клиенты, брокеры, приглашения, «Мои рейсы»
     dp.include_router(bot_router)
     set_notify_bot(bot)
     
@@ -155,6 +161,8 @@ async def start_polling():
     
     # Инициализация базы данных
     await init_db()
+    async with get_session() as session:
+        await reload_admins(session)
     
     # Создание бота
     bot = Bot(
@@ -173,6 +181,7 @@ async def start_polling():
     
     dp = Dispatcher(storage=storage)
     dp.include_router(admin_router)  # раньше основного: /admin и шаги админа важнее шагов водителя
+    dp.include_router(roles_router)  # клиенты, брокеры, приглашения, «Мои рейсы»
     dp.include_router(bot_router)
     set_notify_bot(bot)
     

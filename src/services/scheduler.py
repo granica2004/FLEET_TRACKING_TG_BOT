@@ -148,7 +148,7 @@ async def check_last_call_triggers():
             if should_trigger:
                 try:
                     # Получаем водителя
-                    driver = await crud.get_driver_by_id(session, trip.driver_id)
+                    driver = await crud.get_driver_by_id(session, trip.driver_id) if trip.driver_id else None
                     if driver:
                         await _bot.send_message(
                             driver.telegram_id,
@@ -163,6 +163,8 @@ async def check_last_call_triggers():
                         
                         logger.info(f"Last call triggered for trip {trip.id}: {trigger_reason}")
                         
+                        from src.services import events
+                        await events.on_last_call(session, trip, trigger_reason)
                         from src.services.notify import notify_admins
                         from src.services.trips import deal_link
                         from src.bot.admin import trip_button
@@ -191,6 +193,8 @@ async def check_silent_drivers():
     border = datetime.utcnow() - timedelta(hours=settings.silence_hours)
     async with get_session() as session:
         for trip in await crud.list_active_trips(session):
+            if not trip.driver_id:
+                continue  # водитель ещё не подключился по ссылке
             loc = await crud.get_last_trip_location(session, trip)
             last_seen = loc.recorded_at if loc else trip.started_at
             if not last_seen or last_seen > border:

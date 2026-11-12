@@ -30,6 +30,9 @@ EVENT_TITLES = {
     "done": "Завершение рейса",
     "error": "Ошибки Битрикс24",
     "digest": "Утренняя сводка",
+    "border": "Пересечение границы",
+    "arrival": "Машина у терминала",
+    "people": "Новые клиенты и брокеры",
 }
 
 _bot: Optional[Bot] = None
@@ -41,7 +44,8 @@ def set_notify_bot(bot: Bot):
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in settings.admin_ids
+    from src.services.access import is_admin as _is_admin
+    return _is_admin(user_id)
 
 
 async def event_enabled(event: str) -> bool:
@@ -61,14 +65,16 @@ async def notify_admins(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
 ):
     """Отправить уведомление всем админам, если тип события включён. Ошибки не пробрасывает."""
-    if not _bot or not settings.admin_ids:
+    from src.services.access import all_admin_ids
+    admin_ids = all_admin_ids()
+    if not _bot or not admin_ids:
         return
     try:
         if not await event_enabled(event):
             return
     except Exception:
         pass
-    for admin_id in settings.admin_ids:
+    for admin_id in admin_ids:
         try:
             await _bot.send_message(
                 admin_id, text, reply_markup=reply_markup,
@@ -85,3 +91,7 @@ def fire(event: str, text: str, reply_markup: Optional[InlineKeyboardMarkup] = N
         asyncio.get_running_loop().create_task(notify_admins(event, text, reply_markup))
     except RuntimeError:
         pass
+
+
+def get_bot() -> Optional[Bot]:
+    return _bot

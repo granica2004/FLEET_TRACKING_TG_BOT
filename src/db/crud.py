@@ -368,8 +368,9 @@ async def get_last_trip_location(session: AsyncSession, trip: Trip) -> Optional[
         select(Location)
         .where(or_(
             Location.trip_id == trip.id,
-            and_(Location.driver_id == trip.driver_id, Location.recorded_at >= trip.started_at),
-        ))
+            and_(Location.driver_id == trip.driver_id, Location.trip_id.is_(None),
+                 Location.recorded_at >= trip.started_at),
+        ) if trip.driver_id else Location.trip_id == trip.id)
         .order_by(Location.recorded_at.desc())
         .limit(1)
     )
@@ -437,3 +438,27 @@ async def set_setting(session: AsyncSession, key: str, value: str):
     else:
         session.add(AppSetting(key=key, value=value))
     await session.flush()
+
+
+
+async def get_driverless_trip_by_truck(session: AsyncSession, truck_number: str) -> Optional[Trip]:
+    """Активный рейс без водителя (создан брокером/админом) с этим номером"""
+    result = await session.execute(
+        select(Trip).where(and_(
+            Trip.truck_number == truck_number.upper(), Trip.status == "active", Trip.driver_id.is_(None),
+        )).order_by(Trip.created_at.desc()).limit(1)
+    )
+    return result.scalars().first()
+
+
+async def get_trip_points(session: AsyncSession, trip: Trip) -> List[Location]:
+    """Все точки рейса по времени (для истории и карты)"""
+    conds = [Location.trip_id == trip.id]
+    if trip.driver_id:
+        conds.append(and_(Location.driver_id == trip.driver_id, Location.trip_id.is_(None),
+                          Location.recorded_at >= trip.started_at))
+    q = select(Location).where(or_(*conds))
+    if trip.completed_at:
+        q = q.where(Location.recorded_at <= trip.completed_at)
+    result = await session.execute(q.order_by(Location.recorded_at.asc()))
+    return list(result.scalars().all())

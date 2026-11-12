@@ -260,6 +260,74 @@ class Bitrix24Client:
         
         return deal.get("CLOSED") == "Y"
     
+    # ==================== КЛИЕНТЫ ====================
+    
+    @staticmethod
+    def phone_variants(phone: str) -> List[str]:
+        digits = "".join(ch for ch in str(phone) if ch.isdigit())
+        if not digits:
+            return []
+        out = {digits, "+" + digits}
+        if len(digits) == 11 and digits[0] in "78":
+            out |= {"7" + digits[1:], "+7" + digits[1:], "8" + digits[1:]}
+        return sorted(out)
+    
+    async def find_client_by_phone(self, phone: str) -> Optional[Dict[str, Any]]:
+        """
+        Контакт по телефону → его компания.
+        Возвращает {contact_id, company_id, contact_name, company_title} или None.
+        """
+        values = self.phone_variants(phone)
+        if not values:
+            return None
+        found = await self._request("crm.duplicate.findbycomm", {
+            "type": "PHONE", "values": values, "entity_type": "CONTACT",
+        })
+        contact_ids = (found or {}).get("CONTACT") if isinstance(found, dict) else None
+        if not contact_ids:
+            return None
+        # Предпочитаем контакт с компанией
+        best = None
+        for cid in contact_ids[:5]:
+            c = await self._request("crm.contact.get", {"id": cid})
+            if not c:
+                continue
+            item = {
+                "contact_id": int(c["ID"]),
+                "company_id": int(c["COMPANY_ID"]) if c.get("COMPANY_ID") and str(c["COMPANY_ID"]) != "0" else None,
+                "contact_name": " ".join(x for x in [c.get("NAME"), c.get("LAST_NAME")] if x),
+                "company_title": None,
+            }
+            if item["company_id"]:
+                best = item
+                break
+            best = best or item
+        if best and best["company_id"]:
+            company = await self._request("crm.company.get", {"id": best["company_id"]})
+            best["company_title"] = (company or {}).get("TITLE")
+        return best
+    
+    async def find_company_by_inn(self, inn: str) -> Optional[Dict[str, Any]]:
+        """Компания по ИНН из реквизитов: {company_id, company_title} или None."""
+        inn = "".join(ch for ch in str(inn) if ch.isdigit())
+        if len(inn) not in (10, 12):
+            return None
+        rows = await self._request("crm.requisite.list", {
+            "filter": {"RQ_INN": inn, "ENTITY_TYPE_ID": 4},
+            "select": ["ENTITY_ID", "RQ_COMPANY_NAME"],
+        })
+        if not rows:
+            return None
+        company_id = int(rows[0]["ENTITY_ID"])
+        company = await self._request("crm.company.get", {"id": company_id})
+        return {
+            "company_id": company_id,
+            "company_title": (company or {}).get("TITLE") or rows[0].get("RQ_COMPANY_NAME"),
+        }
+    
+    async def set_stage(self, deal_id: int, stage_id: str) -> bool:
+        return await self.update_deal(deal_id, {"STAGE_ID": stage_id})
+    
     # ==================== ТЕРМИНАЛЫ ====================
     
     async def get_terminal_from_deal(self, deal: Dict[str, Any]) -> Optional[str]:

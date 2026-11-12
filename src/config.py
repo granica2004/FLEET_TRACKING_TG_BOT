@@ -79,6 +79,8 @@ class Settings(BaseSettings):
     admin_ids_raw: str = Field("96658990", validation_alias="ADMIN_IDS")
     # Через сколько часов без геопозиции считать водителя «молчащим»
     silence_hours: int = Field(24, env="SILENCE_HOURS")
+    # Радиус «машина у терминала», км
+    arrival_radius_km: float = Field(2.0, env="ARRIVAL_RADIUS_KM")
     # Ежедневная сводка админам (час UTC; 6 = 9:00 МСК)
     admin_digest_hour: int = Field(6, env="ADMIN_DIGEST_HOUR")
 

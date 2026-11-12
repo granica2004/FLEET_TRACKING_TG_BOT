@@ -34,6 +34,14 @@ class GeocoderService:
         self.timeout = httpx.Timeout(10.0)
         self.user_agent = "DriverTrackingBot/1.0 (Telegram bot for logistics)"
     
+    async def reverse_details(self, latitude: float, longitude: float) -> Tuple[str, Optional[str]]:
+        """Адрес и ISO-код страны (kz, ru, uz…)."""
+        self._last_country = None
+        address = await self.reverse_geocode(latitude, longitude)
+        return address, self._last_country
+    
+    _last_country: Optional[str] = None
+    
     async def reverse_geocode(self, latitude: float, longitude: float) -> Optional[str]:
         """
         Получить адрес по координатам.
@@ -70,6 +78,7 @@ class GeocoderService:
                 data = response.json()
                 
                 address = data.get("display_name")
+                self._last_country = ((data.get("address") or {}).get("country_code") or None)
                 if address:
                     logger.debug(f"LocationIQ: ({lat}, {lon}) -> {address[:50]}...")
                     return address
@@ -105,6 +114,7 @@ class GeocoderService:
                 data = response.json()
                 
                 address = data.get("display_name")
+                self._last_country = ((data.get("address") or {}).get("country_code") or None)
                 if address:
                     logger.debug(f"Nominatim: ({lat}, {lon}) -> {address[:50]}...")
                     return address
@@ -310,6 +320,10 @@ class MapsService:
     async def reverse_geocode(self, latitude: float, longitude: float) -> Optional[str]:
         """Обратное геокодирование (делегируем в GeocoderService)"""
         return await self.geocoder.reverse_geocode(latitude, longitude)
+    
+    async def reverse_details(self, latitude: float, longitude: float):
+        """(адрес, код страны)"""
+        return await self.geocoder.reverse_details(latitude, longitude)
     
     def get_terminal_info(self, terminal_code: str) -> Optional[Dict[str, Any]]:
         """Получить информацию о терминале из справочника"""

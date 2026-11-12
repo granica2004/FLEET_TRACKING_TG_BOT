@@ -3,6 +3,7 @@ FastAPI эндпоинты для webhooks от Telegram и Битрикс24.
 """
 
 from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi.responses import HTMLResponse
 from aiogram import Bot, Dispatcher
 from aiogram.types import Update
 from loguru import logger
@@ -138,7 +139,9 @@ async def bitrix_deal_update_webhook(request: Request):
                     return {"status": "ok", "message": "No active trip"}
                 
                 await crud.complete_trip(session, trip.id)
-                driver = await crud.get_driver_by_id(session, trip.driver_id)
+                from src.services import events
+                await events.on_finished(session, trip)
+                driver = await crud.get_driver_by_id(session, trip.driver_id) if trip.driver_id else None
                 if driver and _bot:
                     try:
                         await _bot.send_message(
@@ -167,6 +170,21 @@ async def bitrix_deal_update_webhook(request: Request):
             if not truck_number:
                 return {"status": "ok", "message": "No truck number"}
             
+            from src.services import events
+            
+            # Рейс, созданный брокером/админом без сделки, с тем же номером
+            prepared = await crud.get_driverless_trip_by_truck(session, truck_number)
+            if prepared and not prepared.bitrix_deal_id:
+                apply_deal_to_trip(prepared, deal)
+                await events.on_trip_started(session, prepared)
+                await notify_admins(
+                    "match",
+                    f"🔗 <b>Рейс привязан к сделке</b> {escape(truck_number)}\n"
+                    f"📋 {deal_link(deal_id, deal.get('TITLE'))}",
+                    trip_button(prepared.id),
+                )
+                return {"status": "ok", "message": "Prepared trip linked"}
+            
             # Водитель, ожидающий сделку с этим номером
             registration = await crud.find_waiting_registration(session, truck_number)
             if registration:
@@ -176,6 +194,7 @@ async def bitrix_deal_update_webhook(request: Request):
                 if waiting_trip and not waiting_trip.bitrix_deal_id:
                     await crud.match_registration_with_deal(session, truck_number, deal_id)
                     apply_deal_to_trip(waiting_trip, deal)
+                    await events.on_trip_started(session, waiting_trip)
                     await bitrix_client.update_driver_telegram_id(deal_id, registration.telegram_id)
                     await bitrix_client.add_timeline_comment(
                         deal_id, f"🚛 Водитель {truck_number} привязан к сделке Telegram-ботом отслеживания."
@@ -228,6 +247,78 @@ async def bitrix_deal_update_webhook(request: Request):
         logger.exception(f"Error processing Bitrix24 webhook: {e}")
         # Не возвращаем ошибку, чтобы Битрикс не пытался повторить
         return {"status": "error", "message": str(e)}
+
+
+# ==================== КАРТА МАРШРУТА ====================
+
+TRACK_HTML = """<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Маршрут __TITLE__</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html,body{margin:0;height:100%;font-family:-apple-system,Segoe UI,Roboto,sans-serif}
+  #map{position:absolute;top:56px;bottom:0;left:0;right:0}
+  header{height:56px;padding:6px 12px;box-sizing:border-box;border-bottom:1px solid #ddd;background:#fff}
+  header b{font-size:15px} header div{font-size:12px;color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+</style></head><body>
+<header><b>__TITLE__</b><div>__SUB__</div></header>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const pts = __POINTS__, term = __TERM__;
+const map = L.map('map');
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {maxZoom: 18, attribution: '&copy; OpenStreetMap'}).addTo(map);
+const ll = pts.map(p => [p.lat, p.lon]);
+const bounds = [];
+if (ll.length) {
+  L.polyline(ll, {color: '#1565c0', weight: 4}).addTo(map);
+  pts.forEach((p, i) => {
+    const last = i === pts.length - 1;
+    L.circleMarker([p.lat, p.lon], {radius: last ? 9 : 4, color: last ? '#c62828' : '#1565c0',
+      fillOpacity: last ? 0.9 : 0.6}).addTo(map).bindPopup('<b>' + p.t + '</b><br>' + p.a);
+    bounds.push([p.lat, p.lon]);
+  });
+}
+if (term) {
+  L.marker([term.lat, term.lon]).addTo(map).bindPopup('<b>Терминал</b><br>' + term.name);
+  bounds.push([term.lat, term.lon]);
+}
+if (bounds.length > 1) map.fitBounds(bounds, {padding: [30, 30]});
+else if (bounds.length === 1) map.setView(bounds[0], 10);
+else map.setView([50, 60], 4);
+</script></body></html>"""
+
+
+@router.get("/track/{trip_id}/{sig}", response_class=HTMLResponse)
+async def track_page(trip_id: int, sig: str):
+    """Карта маршрута рейса. Ссылка подписана — открывается только по ссылке из бота."""
+    import hmac as _hmac
+    import json
+    from src.services import access
+    from src.services.trips import msk
+    if not _hmac.compare_digest(sig, access.track_sig(trip_id)):
+        raise HTTPException(status_code=404, detail="Not found")
+    async with get_session() as session:
+        trip = await crud.get_trip_by_id(session, trip_id)
+        if not trip:
+            raise HTTPException(status_code=404, detail="Not found")
+        points = await crud.get_trip_points(session, trip)
+    t = TERMINALS.get(str(trip.terminal_code or ""), {})
+    data = [{"lat": p.latitude, "lon": p.longitude, "t": msk(p.recorded_at) + " МСК",
+             "a": escape(", ".join((p.address or "").split(", ")[:4]))} for p in points]
+    term = {"lat": t["lat"], "lon": t["lon"], "name": escape(t.get("address_ru", t.get("code", "")))} \
+        if t.get("lat") and t.get("lon") else None
+    sub = f"{escape(terminal_name(trip.terminal_code))} · точек: {len(points)}"
+    if points:
+        sub += f" · последняя {msk(points[-1].recorded_at)} МСК"
+    html = (TRACK_HTML
+            .replace("__TITLE__", escape(trip.truck_number))
+            .replace("__SUB__", sub)
+            .replace("__POINTS__", json.dumps(data, ensure_ascii=False).replace("</", "<\\/"))
+            .replace("__TERM__", json.dumps(term, ensure_ascii=False).replace("</", "<\\/")))
+    return HTMLResponse(html)
 
 
 # ==================== API ДЛЯ РУЧНОГО УПРАВЛЕНИЯ ====================

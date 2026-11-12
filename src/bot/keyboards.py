@@ -24,8 +24,7 @@ def location_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📍 Отправить местоположение", request_location=True)],
-            [KeyboardButton(text="📝 Уведомить о прибытии")],
-            [KeyboardButton(text="🏭 Адрес терминала назначения")],
+            [KeyboardButton(text="📍 Терминал прибытия"), KeyboardButton(text="📝 Дата прибытия")],
             [
                 KeyboardButton(text="🔄 Новая перевозка"),
                 KeyboardButton(text="❌ Завершить текущую")
@@ -112,3 +111,73 @@ def remove_keyboard() -> ReplyKeyboardMarkup:
     """Убрать клавиатуру (пустая)"""
     from aiogram.types import ReplyKeyboardRemove
     return ReplyKeyboardRemove()
+
+
+TERMINAL_BUTTON_TEXTS = ("📍 Терминал прибытия", "🏭 Адрес терминала назначения")
+ARRIVAL_BUTTON_TEXTS = ("📝 Дата прибытия", "📝 Уведомить о прибытии")
+
+
+def role_choice_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🚛 Я водитель")],
+            [KeyboardButton(text="📦 Я получатель груза")],
+            [KeyboardButton(text="🌍 Я отправитель / брокер")],
+        ],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
+
+def phone_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📱 Поделиться номером", request_contact=True)],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
+
+def skip_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Пропустить")], [KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
+
+def client_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📦 Мои рейсы")], [KeyboardButton(text="✉️ Написать диспетчеру")]],
+        resize_keyboard=True,
+    )
+
+
+def broker_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📦 Мои рейсы"), KeyboardButton(text="➕ Новый рейс")],
+            [KeyboardButton(text="✉️ Написать диспетчеру")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🛠 Админка"), KeyboardButton(text="📦 Все рейсы")],
+            [KeyboardButton(text="➕ Новый рейс")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def terminal_nav_keyboard(lat: float, lon: float, extra: dict = None) -> InlineKeyboardMarkup:
+    """Маршрут до терминала в навигаторах"""
+    rows = [
+        [InlineKeyboardButton(text="🧭 Маршрут в Яндекс Картах",
+                              url=f"https://yandex.ru/maps/?rtext=~{lat},{lon}&rtt=auto")],
+        [InlineKeyboardButton(text="🧭 Маршрут в Google Maps",
+                              url=f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=driving")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)

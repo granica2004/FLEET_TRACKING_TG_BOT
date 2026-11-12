@@ -41,13 +41,24 @@ def deal_trip_fields(deal: Dict[str, Any]) -> Dict[str, Any]:
         "destination_lon": t.get("lon"),
         "shipment_date": _parse_dt(deal.get(settings.bitrix_field_shipment_date)),
         "planned_arrival_date": _parse_dt(deal.get(settings.bitrix_field_planned_arrival)),
+        "bitrix_company_id": _int(deal.get("COMPANY_ID")),
+        "bitrix_contact_id": _int(deal.get("CONTACT_ID")),
     }
+
+
+def _int(v) -> Optional[int]:
+    try:
+        v = int(v)
+        return v or None
+    except (TypeError, ValueError):
+        return None
 
 
 def apply_deal_to_trip(trip, deal: Dict[str, Any]):
     """Привязать существующий рейс к сделке (без коммита)."""
     for key, value in deal_trip_fields(deal).items():
-        if value is None and key in ("shipment_date", "planned_arrival_date") and getattr(trip, key):
+        if value is None and key in ("shipment_date", "planned_arrival_date",
+                                     "bitrix_company_id", "bitrix_contact_id") and getattr(trip, key):
             continue  # не затираем известную дату пустой
         setattr(trip, key, value)
     trip.updated_at = datetime.utcnow()

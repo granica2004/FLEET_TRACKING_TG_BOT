@@ -53,7 +53,8 @@ class Trip(Base):
     __tablename__ = "trips"
     
     id = Column(Integer, primary_key=True, index=True)
-    driver_id = Column(Integer, ForeignKey("drivers.id"), nullable=False)
+    # Может быть пустым: рейс создан брокером/админом, водитель ещё не подключился по ссылке
+    driver_id = Column(Integer, ForeignKey("drivers.id"), nullable=True)
     
     # Связь с Битрикс24
     bitrix_deal_id = Column(Integer, nullable=True, index=True)
@@ -88,6 +89,14 @@ class Trip(Base):
     last_call_date = Column(DateTime, nullable=True)
     # Когда админу последний раз сообщили, что водитель молчит
     silence_alert_at = Column(DateTime, nullable=True)
+    # Когда разослали «машина у терминала»
+    arrived_notified_at = Column(DateTime, nullable=True)
+    
+    # Получатель по сделке (для доступа клиента)
+    bitrix_company_id = Column(Integer, nullable=True, index=True)
+    bitrix_contact_id = Column(Integer, nullable=True, index=True)
+    # Кто создал рейс (брокер или админ), participants.id
+    created_by_participant_id = Column(Integer, nullable=True, index=True)
     
     # Telegram группа для уведомлений
     telegram_group_id = Column(String(50), nullable=True)
@@ -136,6 +145,9 @@ class Location(Base):
     
     # Источник данных
     source = Column(String(20), default="telegram")  # telegram, manual
+    
+    # Страна точки (ISO-код, из геокодера) — для событий пересечения границы
+    country_code = Column(String(5), nullable=True)
     
     # Метаданные
     recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -200,3 +212,58 @@ class AppSetting(Base):
     key = Column(String(100), primary_key=True)
     value = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+
+class Participant(Base):
+    """
+    Участник, кроме водителя: менеджер-админ, брокер/отправитель, клиент/получатель.
+    Владелец (ADMIN_IDS) хранится в переменной окружения, не здесь.
+    """
+
+    __tablename__ = "participants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False, index=True)
+    username = Column(String(255), nullable=True)
+    full_name = Column(String(255), nullable=True)
+    phone = Column(String(30), nullable=True)
+
+    role = Column(String(20), nullable=False)          # admin, broker, client
+    status = Column(String(20), default="pending")     # pending, active, blocked
+
+    # Привязка к Битрикс24 (для клиента)
+    bitrix_company_id = Column(Integer, nullable=True, index=True)
+    bitrix_contact_id = Column(Integer, nullable=True, index=True)
+    company_title = Column(String(500), nullable=True)
+    inn = Column(String(20), nullable=True)
+    note = Column(Text, nullable=True)                  # что ввёл человек при регистрации
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TripAccess(Base):
+    """Рейсы, открытые брокеру админом"""
+
+    __tablename__ = "trip_access"
+
+    id = Column(Integer, primary_key=True)
+    trip_id = Column(Integer, ForeignKey("trips.id"), nullable=False, index=True)
+    participant_id = Column(Integer, ForeignKey("participants.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Invite(Base):
+    """Пригласительные ссылки: роль (broker/admin) или водитель в конкретный рейс"""
+
+    __tablename__ = "invites"
+
+    code = Column(String(40), primary_key=True)
+    kind = Column(String(20), nullable=False)          # broker, admin, driver
+    trip_id = Column(Integer, nullable=True)
+    created_by = Column(BigInteger, nullable=True)     # Telegram ID создателя
+    used_by = Column(BigInteger, nullable=True)
+    used_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

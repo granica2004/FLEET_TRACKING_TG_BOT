@@ -37,9 +37,17 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
         # Новые колонки в существующих таблицах (create_all их не добавляет)
         if conn.dialect.name == "postgresql":
-            await conn.execute(text(
-                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS silence_alert_at TIMESTAMP"
-            ))
+            for ddl in (
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS silence_alert_at TIMESTAMP",
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS arrived_notified_at TIMESTAMP",
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS bitrix_company_id INTEGER",
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS bitrix_contact_id INTEGER",
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS created_by_participant_id INTEGER",
+                "ALTER TABLE trips ALTER COLUMN driver_id DROP NOT NULL",
+                "ALTER TABLE locations ADD COLUMN IF NOT EXISTS country_code VARCHAR(5)",
+                "CREATE INDEX IF NOT EXISTS ix_trips_company ON trips (bitrix_company_id)",
+            ):
+                await conn.execute(text(ddl))
     logger.info("Database initialized")
 
 

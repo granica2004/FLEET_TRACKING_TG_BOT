@@ -25,6 +25,7 @@ from src.db import crud
 from src.db.database import get_session
 from src.services.bitrix import bitrix_client
 from src.services.notify import EVENT_TITLES, is_admin
+from src.services import access, events
 from src.services.trips import (
     ago, apply_deal_to_trip, deal_link, driver_label, msk,
 )
@@ -44,6 +45,7 @@ class AdminFilter(BaseFilter):
 class AdminStates(StatesGroup):
     bind_deal = State()      # ввод ID сделки для привязки рейса
     msg_driver = State()     # ввод текста водителю
+    msg_participant = State()  # ввод текста клиенту/брокеру
 
 
 def btn(text: str, data: str) -> InlineKeyboardButton:
@@ -62,8 +64,8 @@ def menu_kb() -> InlineKeyboardMarkup:
         [btn("📊 Сводка", "adm:sum")],
         [btn("🚛 В пути", "adm:trips:a:0"), btn("⏳ Без сделки", "adm:trips:u:0")],
         [btn("🔕 Молчат", "adm:trips:s:0"), btn("🏁 Близко к терминалу", "adm:trips:n:0")],
-        [btn("👤 Водители", "adm:drv:0"), btn("🏭 Терминалы", "adm:term")],
-        [btn("🔔 Уведомления", "adm:ntf")],
+        [btn("👤 Водители", "adm:drv:0"), btn("👥 Клиенты и брокеры", "adm:ppl")],
+        [btn("🏭 Терминалы", "adm:term"), btn("🔔 Уведомления", "adm:ntf")],
     ])
 
 
@@ -78,7 +80,7 @@ async def _trip_rows(session, kind: str):
     for t in trips:
         loc = await crud.get_last_trip_location(session, t)
         last_seen = loc.recorded_at if loc else t.started_at
-        if kind == "s" and last_seen and last_seen > silence_border:
+        if kind == "s" and (not t.driver_id or (last_seen and last_seen > silence_border)):
             continue
         if kind == "n":
             dist = loc.distance_to_destination_km if loc else None
@@ -107,12 +109,17 @@ async def _summary_text(session) -> str:
     near = await _trip_rows(session, "n")
     drivers = await crud.list_drivers(session)
     blocked = sum(1 for d in drivers if not d.is_active)
+    pending = await access.list_participants(session, status="pending")
+    clients = await access.list_participants(session, role="client", status="active")
+    brokers = await access.list_participants(session, role="broker", status="active")
     return (
         "📊 <b>Сводка</b>\n\n"
         f"🚛 В пути: <b>{len(active)}</b> (со сделкой {linked}, без сделки {len(active) - linked})\n"
         f"🔕 Молчат дольше {settings.silence_hours} ч: <b>{len(silent)}</b>\n"
         f"🏁 Ближе {settings.last_call_distance_km} км к терминалу: <b>{len(near)}</b>\n"
-        f"👤 Водителей: {len(drivers)}" + (f", заблокировано {blocked}" if blocked else "")
+        f"👤 Водителей: {len(drivers)}" + (f", заблокировано {blocked}" if blocked else "") + "\n"
+        f"👥 Клиентов: {len(clients)}, брокеров: {len(brokers)}"
+        + (f"\n🙋 <b>Ждут подтверждения: {len(pending)}</b>" if pending else "")
     )
 
 
@@ -126,7 +133,7 @@ async def trip_card(session, trip_id: int):
     status = {"active": "в пути", "completed": "завершён", "cancelled": "отменён"}.get(t.status, t.status)
     lines = [
         f"🚛 <b>{escape(t.truck_number)}</b>" + (f" / {escape(t.trailer_number)}" if t.trailer_number else ""),
-        f"👤 {driver_label(driver)}",
+        f"👤 {driver_label(driver) if driver else 'водитель ещё не подключился'}",
         f"📋 {deal_link(t.bitrix_deal_id, t.bitrix_deal_title)}",
         f"🏭 {escape(terminal_name(t.terminal_code))}",
         f"🕐 Рейс начат: {msk(t.started_at)} ({ago(t.started_at)}), статус: {status}",
@@ -146,16 +153,27 @@ async def trip_card(session, trip_id: int):
 
     kb: List[List[InlineKeyboardButton]] = []
     if t.status == "active":
-        kb.append([btn("📍 Запросить геопозицию", f"adm:ask:{t.id}"), btn("✉️ Написать", f"adm:msg:{t.driver_id}")])
+        if t.driver_id:
+            kb.append([btn("📍 Запросить геопозицию", f"adm:ask:{t.id}"), btn("✉️ Написать", f"adm:msg:{t.driver_id}")])
+        else:
+            kb.append([btn("🔗 Ссылка для водителя", f"adm:dlink:{t.id}")])
         if loc:
-            kb.append([btn("🗺 Последняя точка", f"adm:pt:{t.id}")])
+            row = [btn("🗺 Последняя точка", f"adm:pt:{t.id}"), btn("📜 История", f"v:h:{t.id}")]
+            kb.append(row)
+            url = access.track_url(t.id)
+            if url:
+                kb.append([url_btn("🧭 Маршрут на карте", url)])
+        kb.append([btn("👁 Кто видит рейс", f"adm:acc:{t.id}")])
         if t.bitrix_deal_id:
             kb.append([url_btn("🔗 Открыть сделку", settings.deal_url(t.bitrix_deal_id)),
                        btn("🔁 Перепривязать", f"adm:bind:{t.id}")])
         else:
             kb.append([btn("🔍 Искать в Битриксе", f"adm:find:{t.id}"), btn("🔗 Привязать по ID", f"adm:bind:{t.id}")])
         kb.append([btn("🏁 Завершить рейс", f"adm:fin:{t.id}")])
-    kb.append([btn("👤 Водитель", f"adm:d:{t.driver_id}")] + BACK_MENU)
+    if t.driver_id:
+        kb.append([btn("👤 Водитель", f"adm:d:{t.driver_id}")] + BACK_MENU)
+    else:
+        kb.append(BACK_MENU)
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
 
 
@@ -214,6 +232,11 @@ async def cmd_admin(message: Message, state: FSMContext):
     async with get_session() as session:
         text = await _summary_text(session)
     await message.answer(text + "\n\n🛠 <b>Админка</b>", reply_markup=menu_kb(), parse_mode="HTML")
+
+
+@router.message(F.text == "🛠 Админка", AdminFilter())
+async def btn_admin(message: Message, state: FSMContext):
+    await cmd_admin(message, state)
 
 
 @router.message(Command("cancel"), AdminFilter())
@@ -390,6 +413,7 @@ async def _bind(bot, session, trip, deal: dict):
         trip.bitrix_deal_id,
         f"🚛 Диспетчер привязал рейс {trip.truck_number} к сделке в Telegram-боте отслеживания.",
     )
+    await events.on_trip_started(session, trip)
     if driver:
         try:
             await bot.send_message(
@@ -425,6 +449,7 @@ async def cb_finish(cb: CallbackQuery):
             if t.bitrix_deal_id:
                 await bitrix_client.add_timeline_comment(
                     t.bitrix_deal_id, "🏁 Диспетчер завершил отслеживание рейса в Telegram-боте.")
+            await events.on_finished(session, t)
             if driver:
                 try:
                     await cb.bot.send_message(
@@ -569,6 +594,318 @@ async def cb_notify_toggle(cb: CallbackQuery):
     await _edit(cb, "🔔 <b>Уведомления админам</b>\nНажмите, чтобы включить или выключить.\n"
                     "Настройка общая для всех админов.", kb)
     await cb.answer("Выключено" if on else "Включено")
+
+
+# ==================== КЛИЕНТЫ, БРОКЕРЫ, МЕНЕДЖЕРЫ ====================
+
+PPL_FILTERS = {"p": ("🙋 Ждут подтверждения", None, "pending"), "b": ("🌍 Брокеры", "broker", None),
+               "c": ("📦 Клиенты", "client", None), "a": ("⭐ Менеджеры", "admin", None)}
+
+
+@router.callback_query(F.data == "adm:ppl", AdminFilter())
+async def cb_people(cb: CallbackQuery):
+    async with get_session() as session:
+        counts = {}
+        for key, (_, role, status) in PPL_FILTERS.items():
+            counts[key] = len(await access.list_participants(session, role=role, status=status))
+    kb = [[btn(f"{title}: {counts[key]}", f"adm:pl:{key}:0")] for key, (title, _, _) in PPL_FILTERS.items()]
+    kb.append([btn("➕ Пригласить брокера", "adm:inv:broker")])
+    if access.is_owner(cb.from_user.id):
+        kb.append([btn("➕ Пригласить менеджера (админ)", "adm:inv:admin")])
+    kb.append(BACK_MENU)
+    await _edit(cb, "👥 <b>Клиенты, брокеры, менеджеры</b>\n\n"
+                    "Клиенты подключаются сами: бот находит их по телефону в Битриксе и сразу открывает "
+                    "рейсы их компании. Брокеры — по вашей ссылке или по заявке, которую вы одобряете.",
+                InlineKeyboardMarkup(inline_keyboard=kb))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("adm:pl:"), AdminFilter())
+async def cb_people_list(cb: CallbackQuery):
+    _, _, key, page = cb.data.split(":")
+    page = int(page)
+    title, role, status = PPL_FILTERS[key]
+    async with get_session() as session:
+        rows = await access.list_participants(session, role=role, status=status)
+    chunk = rows[page * PAGE:(page + 1) * PAGE]
+    mark = {"pending": "🙋 ", "blocked": "🚫 ", "active": ""}
+    kb = [[btn(f"{mark.get(p.status, '')}{p.full_name or p.telegram_id} · {p.company_title or '—'}"[:60],
+               f"adm:p:{p.id}")] for p in chunk]
+    nav = []
+    if page > 0:
+        nav.append(btn("⬅️", f"adm:pl:{key}:{page - 1}"))
+    if (page + 1) * PAGE < len(rows):
+        nav.append(btn("➡️", f"adm:pl:{key}:{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([btn("◀️ Назад", "adm:ppl")] + BACK_MENU)
+    await _edit(cb, f"<b>{title}</b>: {len(rows)}", InlineKeyboardMarkup(inline_keyboard=kb))
+    await cb.answer()
+
+
+async def participant_card(session, pid: int, viewer_id: int):
+    p = await access.get_participant_by_id(session, pid)
+    if not p:
+        return "Не найден.", InlineKeyboardMarkup(inline_keyboard=[BACK_MENU])
+    status = {"pending": "🙋 ждёт подтверждения", "active": "✅ активен", "blocked": "🚫 заблокирован"}[p.status]
+    lines = [
+        f"👤 <b>{escape(p.full_name or '')}</b>" + (f" @{escape(p.username)}" if p.username else ""),
+        f"Роль: {access.ROLE_TITLES.get(p.role, p.role)} — {status}",
+        f"📞 {escape(p.phone or '—')}",
+        f"🏢 {escape(p.company_title or '—')}",
+    ]
+    if p.bitrix_company_id:
+        lines.append(f'🔗 <a href="{settings.bitrix_portal}/crm/company/details/{p.bitrix_company_id}/">'
+                     f'Компания #{p.bitrix_company_id} в Битриксе</a>')
+    if p.bitrix_contact_id:
+        lines.append(f'🔗 <a href="{settings.bitrix_portal}/crm/contact/details/{p.bitrix_contact_id}/">'
+                     f'Контакт #{p.bitrix_contact_id}</a>')
+    if p.inn:
+        lines.append(f"ИНН: {p.inn}")
+    lines.append(f"🆔 <code>{p.telegram_id}</code> · с {msk(p.created_at, '%d.%m.%Y')}")
+    if p.role in ("client", "broker") and p.status == "active":
+        n = len(await access.trips_for_user(session, p.telegram_id))
+        lines.append(f"📦 Видит рейсов (активные и за 30 дней): {n}")
+
+    kb = []
+    if p.status == "pending":
+        kb.append([btn("✅ Одобрить", f"adm:pp:ok:{p.id}"), btn("❌ Отклонить", f"adm:pp:no:{p.id}")])
+    elif p.status == "active":
+        kb.append([btn("🚫 Заблокировать", f"adm:pblk:{p.id}")])
+    else:
+        kb.append([btn("✅ Разблокировать", f"adm:pblk:{p.id}")])
+    if access.is_owner(viewer_id) and p.status == "active":
+        if p.role == "admin":
+            kb.append([btn("⬇️ Снять права админа", f"adm:mkadm:{p.id}")])
+        else:
+            kb.append([btn("⭐ Сделать админом", f"adm:mkadm:{p.id}")])
+    kb.append([btn("✉️ Написать", f"adm:pm:{p.id}"), btn("◀️ Назад", "adm:ppl")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@router.callback_query(F.data.startswith("adm:p:"), AdminFilter())
+async def cb_participant(cb: CallbackQuery):
+    pid = int(cb.data.split(":")[2])
+    async with get_session() as session:
+        text, kb = await participant_card(session, pid, cb.from_user.id)
+    await _edit(cb, text, kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("adm:pp:"), AdminFilter())
+async def cb_participant_decide(cb: CallbackQuery):
+    _, _, decision, pid = cb.data.split(":")
+    async with get_session() as session:
+        p = await access.get_participant_by_id(session, int(pid))
+        if not p:
+            await cb.answer("Не найден", show_alert=True)
+            return
+        if decision == "ok":
+            if p.role == "client" and not (p.bitrix_company_id or p.bitrix_contact_id):
+                await cb.answer("У клиента нет компании в Битриксе — ему нечего показать. "
+                                "Добавьте его телефон в контакт компании и попросите нажать /start.",
+                                show_alert=True)
+                return
+            p.status = "active"
+        else:
+            p.status = "blocked"
+        role, tg = p.role, p.telegram_id
+        text, kb = await participant_card(session, p.id, cb.from_user.id)
+    try:
+        if decision == "ok":
+            from src.bot.roles import menu_for
+            await cb.bot.send_message(tg, "✅ Доступ открыт. «📦 Мои рейсы» — где сейчас машины.",
+                                      reply_markup=menu_for(role))
+        else:
+            await cb.bot.send_message(tg, "К сожалению, в доступе отказано. Свяжитесь с диспетчером.")
+    except Exception as e:
+        logger.warning(f"Cannot notify participant {tg}: {e}")
+    await _edit(cb, text, kb)
+    await cb.answer("Одобрено" if decision == "ok" else "Отклонено")
+
+
+@router.callback_query(F.data.startswith("adm:pblk:"), AdminFilter())
+async def cb_participant_block(cb: CallbackQuery):
+    pid = int(cb.data.split(":")[2])
+    async with get_session() as session:
+        p = await access.get_participant_by_id(session, pid)
+        if p:
+            if p.role == "admin" and not access.is_owner(cb.from_user.id):
+                await cb.answer("Блокировать менеджеров может только владелец", show_alert=True)
+                return
+            p.status = "active" if p.status == "blocked" else "blocked"
+            await session.flush()
+            if p.role == "admin":
+                await access.reload_admins(session)
+        text, kb = await participant_card(session, pid, cb.from_user.id)
+    await _edit(cb, text, kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("adm:mkadm:"), AdminFilter())
+async def cb_make_admin(cb: CallbackQuery):
+    if not access.is_owner(cb.from_user.id):
+        await cb.answer("Только владелец", show_alert=True)
+        return
+    pid = int(cb.data.split(":")[2])
+    async with get_session() as session:
+        p = await access.get_participant_by_id(session, pid)
+        if not p:
+            await cb.answer("Не найден", show_alert=True)
+            return
+        if p.role == "admin":
+            p.role = "broker"
+            note = "Права админа сняты (теперь брокер)"
+        else:
+            p.role = "admin"
+            note = "Теперь админ"
+        await session.flush()
+        await access.reload_admins(session)
+        text, kb = await participant_card(session, pid, cb.from_user.id)
+        tg, role = p.telegram_id, p.role
+    try:
+        from src.bot.roles import menu_for
+        await cb.bot.send_message(tg, "⭐ Вам открыта админка — /admin" if role == "admin"
+                                  else "Права админа сняты.", reply_markup=menu_for(role))
+    except Exception:
+        pass
+    await _edit(cb, text, kb)
+    await cb.answer(note)
+
+
+@router.callback_query(F.data.startswith("adm:inv:"), AdminFilter())
+async def cb_invite(cb: CallbackQuery):
+    kind = cb.data.split(":")[2]
+    if kind == "admin" and not access.is_owner(cb.from_user.id):
+        await cb.answer("Только владелец", show_alert=True)
+        return
+    from src.bot.roles import bot_username
+    async with get_session() as session:
+        inv = await access.create_invite(session, kind, cb.from_user.id, days=7)
+    link = access.invite_link(await bot_username(cb.bot), "inv", inv.code)
+    who = "менеджера (админ)" if kind == "admin" else "брокера / отправителя"
+    await cb.message.answer(
+        f"🔗 Ссылка-приглашение для {who}, одноразовая, действует 7 дней:\n\n{link}\n\n"
+        f"Перешлите её человеку — он откроет бота и сразу получит доступ.",
+        disable_web_page_preview=True,
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("adm:pm:"), AdminFilter())
+async def cb_pm_ask(cb: CallbackQuery, state: FSMContext):
+    pid = int(cb.data.split(":")[2])
+    await state.set_state(AdminStates.msg_participant)
+    await state.update_data(pid=pid)
+    await cb.message.answer("Напишите сообщение — отправлю от имени диспетчера.\n/cancel — отмена")
+    await cb.answer()
+
+
+@router.message(AdminStates.msg_participant, AdminFilter())
+async def st_msg_participant(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Пока можно отправить только текст. /cancel — отмена")
+        return
+    data = await state.get_data()
+    async with get_session() as session:
+        p = await access.get_participant_by_id(session, data["pid"])
+    await state.clear()
+    if not p:
+        await message.answer("Не найден.")
+        return
+    try:
+        await message.bot.send_message(p.telegram_id, f"✉️ <b>Сообщение от диспетчера:</b>\n\n{escape(message.text)}",
+                                       parse_mode="HTML")
+        await message.answer(f"✅ Отправлено: {escape(p.full_name or '')}", reply_markup=menu_kb())
+    except Exception as e:
+        await message.answer(f"Не отправлено: {e}"[:300])
+
+
+# ==================== ДОСТУП К РЕЙСУ ====================
+
+async def access_screen(session, trip_id: int):
+    t = await crud.get_trip_by_id(session, trip_id)
+    watchers = await access.watchers(session, t)
+    shared = {p.id for p in await access.brokers_with_access(session, trip_id)}
+    brokers = await access.list_participants(session, role="broker", status="active")
+    lines = [f"👁 <b>Кто видит рейс {escape(t.truck_number)}</b>\n"]
+    if t.bitrix_company_id:
+        lines.append(f"Клиенты компании #{t.bitrix_company_id} из сделки — видят автоматически.")
+    else:
+        lines.append("⚠️ У рейса нет компании-получателя (нет сделки) — клиенты его пока не видят.")
+    for p in watchers:
+        lines.append(f"• {escape(p.full_name or '')} — {access.ROLE_TITLES.get(p.role, p.role)}"
+                     + (f" ({escape(p.company_title)})" if p.company_title else ""))
+    if not watchers:
+        lines.append("• пока никто, кроме админов и водителя")
+    lines.append("\nОткрыть или закрыть рейс брокеру:")
+    kb = [[btn(f"{'✅' if b.id in shared or b.id == t.created_by_participant_id else '➕'} "
+               f"{b.full_name or b.telegram_id} · {b.company_title or ''}"[:60], f"adm:acct:{t.id}:{b.id}")]
+          for b in brokers]
+    if not brokers:
+        lines.append("брокеров пока нет — пригласите в разделе «👥 Клиенты и брокеры».")
+    kb.append([btn("◀️ К рейсу", f"adm:trip:{t.id}")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@router.callback_query(F.data.startswith("adm:acc:"), AdminFilter())
+async def cb_access(cb: CallbackQuery):
+    trip_id = int(cb.data.split(":")[2])
+    async with get_session() as session:
+        text, kb = await access_screen(session, trip_id)
+    await _edit(cb, text, kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("adm:acct:"), AdminFilter())
+async def cb_access_toggle(cb: CallbackQuery):
+    _, _, trip_id, pid = cb.data.split(":")
+    async with get_session() as session:
+        t = await crud.get_trip_by_id(session, int(trip_id))
+        if t.created_by_participant_id == int(pid):
+            await cb.answer("Брокер сам создал этот рейс — доступ у него всегда", show_alert=True)
+            return
+        opened = await access.toggle_broker_access(session, int(trip_id), int(pid))
+        p = await access.get_participant_by_id(session, int(pid))
+        text, kb = await access_screen(session, int(trip_id))
+        truck = t.truck_number
+    if opened and p:
+        try:
+            await cb.bot.send_message(
+                p.telegram_id, f"🚛 Вам открыт рейс {escape(truck)}.",
+                reply_markup=events.view_button(int(trip_id)), parse_mode="HTML")
+        except Exception:
+            pass
+    await _edit(cb, text, kb)
+    await cb.answer("Открыт" if opened else "Закрыт")
+
+
+@router.callback_query(F.data.startswith("adm:dlink:"), AdminFilter())
+async def cb_driver_link(cb: CallbackQuery):
+    trip_id = int(cb.data.split(":")[2])
+    from src.bot.roles import bot_username
+    async with get_session() as session:
+        inv = await access.create_invite(session, "driver", cb.from_user.id, trip_id=trip_id, days=30)
+    link = access.invite_link(await bot_username(cb.bot), "drv", inv.code)
+    await cb.message.answer(f"🔗 Ссылка для водителя (действует 30 дней):\n\n{link}\n\n"
+                            f"Водитель откроет её, даст согласие — и сразу окажется в этом рейсе.",
+                            disable_web_page_preview=True)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("adm:arr:"), AdminFilter())
+async def cb_set_arrived(cb: CallbackQuery):
+    trip_id = int(cb.data.split(":")[2])
+    async with get_session() as session:
+        t = await crud.get_trip_by_id(session, trip_id)
+    if not t or not t.bitrix_deal_id:
+        await cb.answer("У рейса нет сделки", show_alert=True)
+        return
+    ok = await bitrix_client.set_stage(t.bitrix_deal_id, settings.bitrix_stage_cargo_arrived)
+    if ok:
+        await bitrix_client.update_deal(t.bitrix_deal_id, {
+            settings.bitrix_field_actual_arrival: datetime.utcnow().strftime("%Y-%m-%d")})
+    await cb.answer("Сделка переведена в «Прибыл»" if ok else "Битрикс не принял изменение", show_alert=True)
 
 
 # Кнопки админки у не-админа (например, после удаления из ADMIN_IDS)

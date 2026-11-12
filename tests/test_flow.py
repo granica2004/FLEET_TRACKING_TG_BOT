@@ -18,6 +18,7 @@ os.environ.update({
     "BITRIX24_WEBHOOK_URL": "https://b24-za9auf.bitrix24.ru/rest/1/xxx/",
     "ADMIN_IDS": "1000",
     "APP_ENV": "test",
+    "TELEGRAM_WEBHOOK_URL": "https://bot.test",
 })
 
 import pytest  # noqa: E402
@@ -26,13 +27,20 @@ from aiogram import Bot, Dispatcher  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
 from aiogram.fsm.storage.memory import MemoryStorage  # noqa: E402
 from aiogram.methods import (  # noqa: E402
-    AnswerCallbackQuery, EditMessageText, SendLocation, SendMessage,
+    AnswerCallbackQuery, EditMessageText, GetMe, SendLocation, SendMessage, SendVenue,
 )
-from aiogram.types import Chat, Message, Update  # noqa: E402
+from aiogram.types import Chat, Message, Update, User  # noqa: E402
 
 ADMIN = 1000
 DRIVER1 = 2001
 DRIVER2 = 2002
+DRIVER3 = 2003
+DRIVER4 = 2004
+CLIENT = 3001
+CLIENT2 = 3002
+BROKER = 4001
+BROKER2 = 4002
+MANAGER = 5001
 
 _ids = count(1)
 
@@ -46,7 +54,9 @@ class FakeSession(BaseSession):
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
-        if isinstance(method, (SendMessage, EditMessageText, SendLocation)):
+        if isinstance(method, GetMe):
+            return User(id=1, is_bot=True, first_name="Bot", username="fleet_test_bot")
+        if isinstance(method, (SendMessage, EditMessageText, SendLocation, SendVenue)):
             chat_id = getattr(method, "chat_id", None) or ADMIN
             return Message(message_id=next(_ids), date=datetime.now(),
                            chat=Chat(id=chat_id, type="private"),
@@ -66,6 +76,17 @@ class FakeSession(BaseSession):
                 out.append(m.text)
         return out
 
+    def kb_texts(self, chat_id):
+        """Тексты и callback_data кнопок в сообщениях этому чату"""
+        out = []
+        for m in self.calls:
+            if isinstance(m, (SendMessage, EditMessageText)) and m.chat_id == chat_id and m.reply_markup is not None:
+                rows = getattr(m.reply_markup, "inline_keyboard", None) or []
+                for row in rows:
+                    for b in row:
+                        out.append(f"{b.text}|{b.callback_data or b.url}")
+        return out
+
     def alerts(self):
         return [m.text for m in self.calls if isinstance(m, AnswerCallbackQuery) and m.text]
 
@@ -75,6 +96,7 @@ class FakeSession(BaseSession):
 
 DEAL_100 = {
     "ID": "100", "TITLE": "Курага ООО Ромашка", "STAGE_ID": "UC_SDO64X", "CLOSED": "N",
+    "COMPANY_ID": "50", "CONTACT_ID": "25726",
     "UF_CRM_1586456781744": "01A123BC", "UF_CRM_1711445194523": "86",
     "UF_CRM_1713519647288": "2026-11-05T03:00:00+03:00",
 }
@@ -94,6 +116,7 @@ async def app(env):
     from src.db.database import init_db
     from src.bot import router as bot_router
     from src.bot.admin import router as admin_router
+    from src.bot.roles import router as roles_router
     from src.services import notify
     from src.services.bitrix import bitrix_client
     from src.services.geocoder import maps_service
@@ -104,11 +127,13 @@ async def app(env):
     bot = Bot(token="123456:TESTTOKEN", session=session)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(admin_router)
+    dp.include_router(roles_router)
     dp.include_router(bot_router)
     notify.set_notify_bot(bot)
     set_bot_and_dispatcher(bot, dp)
 
-    bx = {"comments": [], "updates": []}
+    bx = {"comments": [], "updates": [], "stages": []}
+    geo = {"country": "kz", "address": "Казахстан, трасса М-32"}
     deals = {"100": DEAL_100, "555": DEAL_555}
 
     async def find_deal(truck):
@@ -130,7 +155,23 @@ async def app(env):
         return True
 
     async def reverse(lat, lon):
-        return "Казахстан, трасса М-32"
+        return geo["address"], geo["country"]
+
+    async def find_client(phone):
+        if "".join(c for c in phone if c.isdigit()).endswith("9263602326"):
+            return {"contact_id": 25726, "company_id": 50, "contact_name": "Мария",
+                    "company_title": "СОГДИАНА"}
+        return None
+
+    async def find_inn(inn):
+        return {"company_id": 50, "company_title": "СОГДИАНА"} if inn == "7726605312" else None
+
+    async def set_stage(deal_id, stage):
+        bx["stages"].append((deal_id, stage))
+        return True
+
+    async def update_deal(deal_id, fields):
+        return True
 
     async def dist(lat, lon, code):
         return {"distance_km": 150.0, "eta_text": "2 ч."} if code == "86" else None
@@ -140,10 +181,14 @@ async def app(env):
     bitrix_client.add_timeline_comment = add_comment
     bitrix_client.update_driver_telegram_id = update_tg
     bitrix_client.add_location_comment = add_loc
-    maps_service.reverse_geocode = reverse
+    maps_service.reverse_details = reverse
+    bitrix_client.find_client_by_phone = find_client
+    bitrix_client.find_company_by_inn = find_inn
+    bitrix_client.set_stage = set_stage
+    bitrix_client.update_deal = update_deal
     maps_service.get_distance_to_terminal = dist
 
-    env.update(bot=bot, dp=dp, s=session, bx=bx, deals=deals)
+    env.update(bot=bot, dp=dp, s=session, bx=bx, deals=deals, geo=geo)
     return env
 
 
@@ -173,6 +218,15 @@ async def location(env, uid, lat=50.0, lon=60.0):
     await env["dp"].feed_update(env["bot"], upd)
 
 
+async def contact(env, uid, phone):
+    upd = Update.model_validate({"update_id": next(_upd), "message": {
+        "message_id": next(_ids), "date": int(datetime.now().timestamp()),
+        "chat": {"id": uid, "type": "private"}, "from": _user(uid),
+        "contact": {"phone_number": phone, "first_name": "X", "user_id": uid},
+    }})
+    await env["dp"].feed_update(env["bot"], upd)
+
+
 async def press(env, uid, data):
     upd = Update.model_validate({"update_id": next(_upd), "callback_query": {
         "id": str(next(_ids)), "from": _user(uid), "chat_instance": "x", "data": data,
@@ -197,6 +251,9 @@ def joined(lst):
 async def test_driver_registers_with_deal(app):
     s = app["s"]
     await text(app, DRIVER1, "/start")
+    assert "Кто вы?" in joined(s.sent_to(DRIVER1))
+    await text(app, DRIVER1, "🚛 Я водитель")
+    assert "отправитель груза и получатель груза" in joined(s.sent_to(DRIVER1))
     await text(app, DRIVER1, "✅ Даю согласие на передачу геолокации")
     s.clear()
     await text(app, DRIVER1, "01a123bc")
@@ -222,10 +279,14 @@ async def test_location_synced(app):
 async def test_terminal_address_button(app):
     s = app["s"]
     s.clear()
-    await text(app, DRIVER1, "🏭 Адрес терминала назначения")
+    await text(app, DRIVER1, "📍 Терминал прибытия")
     out = joined(s.sent_to(DRIVER1))
-    assert "Автомобилистов" in out and "yandex" in out
-    assert any(isinstance(m, SendLocation) for m in s.calls)
+    assert "Автомобилистов" in out and "Терминал прибытия" in out
+    assert any("rtext=~55.116124,38.730962" in k for k in s.kb_texts(DRIVER1))
+    assert any(isinstance(m, SendVenue) for m in s.calls)
+    s.clear()
+    await text(app, DRIVER1, "🏭 Адрес терминала назначения")  # старая кнопка у водителей
+    assert "Автомобилистов" in joined(s.sent_to(DRIVER1))
 
 
 async def test_admin_menu_and_card(app):
@@ -258,6 +319,7 @@ async def test_non_admin_has_no_access(app):
 async def test_unlinked_driver_manual_bind(app):
     s = app["s"]
     await text(app, DRIVER2, "/start")
+    await text(app, DRIVER2, "🚛 Я водитель")
     await text(app, DRIVER2, "✅ Даю согласие на передачу геолокации")
     s.clear()
     await text(app, DRIVER2, "777XYZ")
@@ -348,6 +410,221 @@ async def test_terminals_screen(app):
     await press(app, ADMIN, "adm:term")
     out = joined(s.sent_to(ADMIN))
     assert "Владивосток" in out and "Троицк" in out and "✅ <code>86</code>" in out
+
+
+# ==================== РОЛИ ====================
+
+import re  # noqa: E402
+
+
+async def _trip100():
+    from src.db.database import get_session
+    from src.db import crud
+    async with get_session() as session:
+        return await crud.get_active_trip_by_deal(session, 100)
+
+
+async def _pid(tg):
+    from src.db.database import get_session
+    from src.services import access
+    async with get_session() as session:
+        return (await access.get_participant(session, tg)).id
+
+
+def _link(texts, prefix):
+    m = re.search(prefix + r"_([A-Za-z0-9]+)", joined(texts))
+    assert m, joined(texts)
+    return m.group(1)
+
+
+async def test_client_by_phone_sees_trip(app):
+    s = app["s"]
+    s.clear()
+    await text(app, CLIENT, "/start")
+    await text(app, CLIENT, "📦 Я получатель груза")
+    await contact(app, CLIENT, "+7 926 360-23-26")
+    out = joined(s.sent_to(CLIENT))
+    assert "Нашли вас" in out and "СОГДИАНА" in out
+    trip = await _trip100()
+    assert any(f"v:t:{trip.id}" in k for k in s.kb_texts(CLIENT))
+    assert "Новый клиент" in joined(s.sent_to(ADMIN))
+    s.clear()
+    await press(app, CLIENT, f"v:t:{trip.id}")
+    card = joined(s.sent_to(CLIENT))
+    assert "01A123BC" in card and "Сейчас:" in card and "Коломна" in card
+    assert any("https://bot.test/track/" in k for k in s.kb_texts(CLIENT))
+    s.clear()
+    await press(app, CLIENT, f"v:h:{trip.id}")
+    assert "История 01A123BC" in joined(s.sent_to(CLIENT))
+    await press(app, CLIENT, f"v:loc:{trip.id}")
+    assert any(isinstance(m, SendLocation) and m.chat_id == CLIENT for m in s.calls)
+
+
+async def test_track_page(app):
+    from src.main import app as fastapi_app
+    from src.services import access
+    trip = await _trip100()
+    transport = httpx.ASGITransport(app=fastapi_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.get(f"/track/{trip.id}/{access.track_sig(trip.id)}")
+        bad = await c.get(f"/track/{trip.id}/wrongsig")
+    assert r.status_code == 200 and "01A123BC" in r.text and "leaflet" in r.text and '"lat": 50.0' in r.text
+    assert bad.status_code == 404
+
+
+async def test_border_and_arrival_events(app):
+    s = app["s"]
+    trip = await _trip100()
+    s.clear()
+    app["geo"].update(country="ru", address="Россия, Оренбургская область")
+    await location(app, DRIVER1, 51.5, 55.1)
+    assert "въехала в Россию" in joined(s.sent_to(CLIENT))
+    assert "въехала в Россию" in joined(s.sent_to(ADMIN))
+    s.clear()
+    app["geo"].update(address="Коломна, проезд Автомобилистов")
+    await location(app, DRIVER1, 55.1165, 38.7310)
+    assert "Машина у терминала" in joined(s.sent_to(CLIENT))
+    assert any(f"adm:arr:{trip.id}" in k for k in s.kb_texts(ADMIN))
+    s.clear()
+    await location(app, DRIVER1, 55.1166, 38.7311)
+    assert "Машина у терминала" not in joined(s.sent_to(CLIENT))  # один раз
+    await press(app, ADMIN, f"adm:arr:{trip.id}")
+    assert (100, "9") in app["bx"]["stages"]
+
+
+async def test_client_by_inn_needs_approval(app):
+    s = app["s"]
+    await text(app, CLIENT2, "/start")
+    await text(app, CLIENT2, "📦 Я получатель груза")
+    await contact(app, CLIENT2, "+70000000000")
+    assert "ИНН" in joined(s.sent_to(CLIENT2))
+    s.clear()
+    await text(app, CLIENT2, "7726605312")
+    assert "Заявка отправлена" in joined(s.sent_to(CLIENT2))
+    assert "Клиент просит доступ" in joined(s.sent_to(ADMIN))
+    s.clear()
+    await text(app, CLIENT2, "📦 Мои рейсы")  # пока заявка не одобрена — рейсов не видно
+    assert "01A123BC" not in str(s.calls)
+    pid = await _pid(CLIENT2)
+    await press(app, ADMIN, f"adm:pp:ok:{pid}")
+    assert "Доступ открыт" in joined(s.sent_to(CLIENT2))
+    s.clear()
+    await text(app, CLIENT2, "📦 Мои рейсы")
+    assert any("01A123BC" in k for k in s.kb_texts(CLIENT2))
+
+
+async def test_broker_invite_creates_trip_and_driver_link(app):
+    s = app["s"]
+    s.clear()
+    await press(app, ADMIN, "adm:inv:broker")
+    code = _link(s.sent_to(ADMIN), "inv")
+    s.clear()
+    await text(app, BROKER, f"/start inv_{code}")
+    assert "отправитель / брокер" in joined(s.sent_to(BROKER))
+    await text(app, BROKER2, f"/start inv_{code}")  # одноразовая
+    assert "недействительна" in joined(s.sent_to(BROKER2))
+    s.clear()
+    await text(app, BROKER, "➕ Новый рейс")
+    await text(app, BROKER, "05B555CC")
+    await text(app, BROKER, "Пропустить")
+    dcode = _link(s.sent_to(BROKER), "drv")
+    assert "Брокер" in joined(s.sent_to(ADMIN)) and "05B555CC" in joined(s.sent_to(ADMIN))
+    s.clear()
+    await text(app, DRIVER3, f"/start drv_{dcode}")
+    assert "отправитель груза и получатель груза" in joined(s.sent_to(DRIVER3))
+    await text(app, DRIVER3, "✅ Даю согласие на передачу геолокации")
+    assert "Вы подключены к рейсу" in joined(s.sent_to(DRIVER3))
+    assert "Груз в пути" in joined(s.sent_to(BROKER))
+    await location(app, DRIVER3)
+    s.clear()
+    await text(app, BROKER, "📦 Мои рейсы")
+    keys = s.kb_texts(BROKER)
+    assert any("05B555CC" in k for k in keys) and not any("01A123BC" in k for k in keys)
+    trip = await _trip100()
+    await press(app, BROKER, f"v:t:{trip.id}")
+    assert "Нет доступа к этому рейсу" in s.alerts()
+    s.clear()
+    await press(app, ADMIN, f"adm:acct:{trip.id}:{await _pid(BROKER)}")
+    assert "Вам открыт рейс 01A123BC" in joined(s.sent_to(BROKER))
+    s.clear()
+    await press(app, BROKER, f"v:t:{trip.id}")
+    assert "01A123BC" in joined(s.sent_to(BROKER))
+
+
+async def test_admin_trip_driver_joins_by_number(app):
+    s = app["s"]
+    s.clear()
+    await text(app, ADMIN, "➕ Новый рейс")
+    await text(app, ADMIN, "07C777DD")
+    await text(app, ADMIN, "Пропустить")
+    assert "start=drv_" in joined(s.sent_to(ADMIN))
+    await text(app, DRIVER4, "/start")
+    await text(app, DRIVER4, "🚛 Я водитель")
+    await text(app, DRIVER4, "✅ Даю согласие на передачу геолокации")
+    s.clear()
+    await text(app, DRIVER4, "07c777dd")
+    assert "Вы подключены к рейсу" in joined(s.sent_to(DRIVER4))
+    assert "Водитель подключился к рейсу" in joined(s.sent_to(ADMIN))
+
+
+async def test_broker_self_registration(app):
+    s = app["s"]
+    await text(app, BROKER2, "/start")
+    await text(app, BROKER2, "🌍 Я отправитель / брокер")
+    await contact(app, BROKER2, "+992900000000")
+    s.clear()
+    await text(app, BROKER2, "Sugd Logistics, Таджикистан")
+    assert "Брокер / отправитель просит доступ" in joined(s.sent_to(ADMIN))
+    s.clear()
+    await text(app, BROKER2, "➕ Новый рейс")  # ещё не одобрен
+    assert "Рейс" not in joined(s.sent_to(BROKER2)) or "создан" not in joined(s.sent_to(BROKER2))
+    await press(app, ADMIN, f"adm:pp:ok:{await _pid(BROKER2)}")
+    assert "Доступ открыт" in joined(s.sent_to(BROKER2))
+
+
+async def test_managers(app):
+    s = app["s"]
+    s.clear()
+    await press(app, ADMIN, "adm:inv:admin")
+    code = _link(s.sent_to(ADMIN), "inv")
+    await text(app, MANAGER, f"/start inv_{code}")
+    s.clear()
+    await text(app, MANAGER, "/admin")
+    assert "Админка" in joined(s.sent_to(MANAGER))
+    await press(app, MANAGER, "adm:inv:admin")
+    assert "Только владелец" in s.alerts()
+    # владелец делает брокера админом и обратно
+    bpid = await _pid(BROKER2)
+    await press(app, ADMIN, f"adm:mkadm:{bpid}")
+    s.clear()
+    await text(app, BROKER2, "/admin")
+    assert "Админка" in joined(s.sent_to(BROKER2))
+    await press(app, ADMIN, f"adm:mkadm:{bpid}")
+    s.clear()
+    await text(app, BROKER2, "/admin")
+    assert "Админка" not in joined(s.sent_to(BROKER2))
+    # менеджер получает уведомления
+    s.clear()
+    await text(app, CLIENT, "Когда приедет машина?")
+    assert "Сообщение" in joined(s.sent_to(MANAGER)) and "Сообщение" in joined(s.sent_to(ADMIN))
+    await press(app, ADMIN, f"adm:pm:{await _pid(CLIENT)}")
+    await text(app, ADMIN, "Завтра утром")
+    assert "Сообщение от диспетчера" in joined(s.sent_to(CLIENT))
+
+
+async def test_people_screens(app):
+    s = app["s"]
+    s.clear()
+    await press(app, ADMIN, "adm:ppl")
+    await press(app, ADMIN, "adm:pl:c:0")
+    await press(app, ADMIN, f"adm:p:{await _pid(CLIENT)}")
+    out = joined(s.sent_to(ADMIN))
+    assert "Клиенты" in out and "Компания #50" in out
+    trip = await _trip100()
+    s.clear()
+    await press(app, ADMIN, f"adm:acc:{trip.id}")
+    out = joined(s.sent_to(ADMIN))
+    assert "Кто видит рейс" in out and "СОГДИАНА" in out
 
 
 async def test_bitrix_webhook_finishes_trip(app):
