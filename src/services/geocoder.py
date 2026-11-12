@@ -313,12 +313,12 @@ class MapsService:
     
     def get_terminal_info(self, terminal_code: str) -> Optional[Dict[str, Any]]:
         """Получить информацию о терминале из справочника"""
-        return TERMINALS.get(terminal_code)
+        return TERMINALS.get(str(terminal_code)) if terminal_code else None
     
     def get_terminal_coordinates(self, terminal_code: str) -> Optional[Tuple[float, float]]:
         """Получить координаты терминала"""
         terminal = self.get_terminal_info(terminal_code)
-        if terminal:
+        if terminal and terminal.get("lat") and terminal.get("lon"):
             return (terminal["lat"], terminal["lon"])
         return None
     

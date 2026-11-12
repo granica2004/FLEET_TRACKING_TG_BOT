@@ -11,6 +11,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from fastapi import FastAPI
 import uvicorn
 from loguru import logger
@@ -20,6 +21,8 @@ from src.db.database import init_db, close_db
 from src.bot import router as bot_router, keyboards
 from src.api import router as api_router, set_bot_and_dispatcher
 from src.services.scheduler import start_scheduler, stop_scheduler, set_bot_instance
+from src.services.notify import set_notify_bot
+from src.bot.admin import router as admin_router
 
 # Конфигурация
 settings = get_settings()
@@ -38,6 +41,28 @@ bot: Bot = None
 dp: Dispatcher = None
 
 
+async def setup_bot_commands(bot: Bot):
+    """Установка команд бота (меню внизу чата)"""
+    commands = [
+        BotCommand(command="start", description="🚛 Начать / Новая перевозка"),
+        BotCommand(command="help", description="❓ Справка"),
+    ]
+    
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+    
+    # Админам — дополнительно /admin в меню
+    admin_commands = commands + [
+        BotCommand(command="admin", description="🛠 Админка"),
+        BotCommand(command="myid", description="🆔 Мой Telegram ID"),
+    ]
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as e:
+            logger.warning(f"Cannot set admin commands for {admin_id}: {e}")
+    logger.info(f"Bot commands set up (admins: {settings.admin_ids})")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager для FastAPI"""
@@ -47,6 +72,7 @@ async def lifespan(app: FastAPI):
     
     # Инициализация базы данных
     await init_db()
+    logger.info("Database initialized")
     
     # Создание бота
     bot = Bot(
@@ -64,13 +90,18 @@ async def lifespan(app: FastAPI):
         storage = MemoryStorage()
     
     dp = Dispatcher(storage=storage)
+    dp.include_router(admin_router)  # раньше основного: /admin и шаги админа важнее шагов водителя
     dp.include_router(bot_router)
+    set_notify_bot(bot)
     
     # Установка бота для webhooks API
     set_bot_and_dispatcher(bot, dp)
     
     # Установка бота для планировщика
     set_bot_instance(bot, keyboards)
+    
+    # Установка команд бота (меню)
+    await setup_bot_commands(bot)
     
     # Настройка webhook (если указан URL)
     if settings.telegram_webhook_url:
@@ -84,6 +115,7 @@ async def lifespan(app: FastAPI):
     
     # Запуск планировщика
     start_scheduler()
+    logger.info("Scheduler started")
     
     logger.info("Application started successfully!")
     
@@ -140,13 +172,18 @@ async def start_polling():
         storage = MemoryStorage()
     
     dp = Dispatcher(storage=storage)
+    dp.include_router(admin_router)  # раньше основного: /admin и шаги админа важнее шагов водителя
     dp.include_router(bot_router)
+    set_notify_bot(bot)
     
     # Установка бота для планировщика
     set_bot_instance(bot, keyboards)
     
     # Удаляем старый webhook
     await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Установка команд бота (меню)
+    await setup_bot_commands(bot)
     
     # Запуск планировщика
     start_scheduler()

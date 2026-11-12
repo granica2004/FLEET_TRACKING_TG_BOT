@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     
     # === Битрикс24 ===
     bitrix24_webhook_url: str = Field(..., env="BITRIX24_WEBHOOK_URL")
+    # Токен исходящего вебхука Битрикс24 (auth[application_token]); пусто — не проверять
+    bitrix_app_token: str = Field("", env="BITRIX_APP_TOKEN")
     
     # Поля сделки
     bitrix_field_truck_number: str = Field("UF_CRM_1586456781744", env="BITRIX_FIELD_TRUCK_NUMBER")
@@ -72,6 +74,33 @@ class Settings(BaseSettings):
     last_call_distance_km: int = Field(200, env="LAST_CALL_DISTANCE_KM")
     last_call_days_in_transit: int = Field(5, env="LAST_CALL_DAYS_IN_TRANSIT")
     
+    # === Админы и уведомления ===
+    # Telegram ID админов через запятую
+    admin_ids_raw: str = Field("96658990", validation_alias="ADMIN_IDS")
+    # Через сколько часов без геопозиции считать водителя «молчащим»
+    silence_hours: int = Field(24, env="SILENCE_HOURS")
+    # Ежедневная сводка админам (час UTC; 6 = 9:00 МСК)
+    admin_digest_hour: int = Field(6, env="ADMIN_DIGEST_HOUR")
+
+    @property
+    def admin_ids(self) -> List[int]:
+        return [int(x) for x in self.admin_ids_raw.replace(" ", "").split(",") if x.strip().isdigit()]
+
+    @property
+    def bitrix_rest_url(self) -> str:
+        """Вебхук REST с актуальным адресом портала (переименован 01.11.2026)."""
+        return self.bitrix24_webhook_url.replace("b24-za9auf.bitrix24.ru", "granica2004.bitrix24.ru")
+
+    @property
+    def bitrix_portal(self) -> str:
+        """https://<портал> — для ссылок на сделки."""
+        from urllib.parse import urlparse
+        u = urlparse(self.bitrix_rest_url)
+        return f"{u.scheme}://{u.netloc}"
+
+    def deal_url(self, deal_id) -> str:
+        return f"{self.bitrix_portal}/crm/deal/details/{deal_id}/"
+
     # === Логирование ===
     log_level: str = Field("INFO", env="LOG_LEVEL")
     
@@ -128,19 +157,31 @@ TERMINALS = {
         "google_maps": "https://maps.app.goo.gl/oZbZfJt2U2maFZCNA",
         "yandex_maps": "https://yandex.ru/maps/-/CPcrNL5d",
     },
-    # TODO: Добавить остальные терминалы
-    # "88": {"code": "Михнево", ...},
-    # "90": {"code": "Новороссийск", ...},
-    # "98": {"code": "Астрахань", ...},
-    # "108": {"code": "Ворсино", ...},
-    # "128": {"code": "Электроугли", ...},
-    # "178": {"code": "СПБ", ...},
-    # "180": {"code": "Селятино", ...},
-    # "274": {"code": "Дербент", ...},
-    # "276": {"code": "Белый Раст", ...},
-    # "300": {"code": "Екатеринбург", ...},
-    # "310": {"code": "Казань", ...},
+    # Остальные терминалы — пока только название (адрес и координаты не заполнены)
+    "88": {"code": "Михнево"},
+    "90": {"code": "Новороссийск"},
+    "98": {"code": "Астрахань"},
+    "108": {"code": "Ворсино"},
+    "128": {"code": "Электроугли"},
+    "178": {"code": "СПБ"},
+    "180": {"code": "Селятино"},
+    "274": {"code": "Дербент"},
+    "276": {"code": "Белый Раст"},
+    "300": {"code": "Екатеринбург"},
+    "310": {"code": "Казань"},
+    "326": {"code": "Троицк"},
+    "396": {"code": "Владивосток"},
 }
+
+
+def terminal_name(terminal_code) -> str:
+    """Название терминала для показа (а не ID из Битрикса)."""
+    if not terminal_code:
+        return "Не указан"
+    t = TERMINALS.get(str(terminal_code), {})
+    if t.get("name_ru"):
+        return f"{t.get('code', '')} — {t['name_ru']}".strip(" —")
+    return t.get("code") or str(terminal_code)
 
 
 @lru_cache()

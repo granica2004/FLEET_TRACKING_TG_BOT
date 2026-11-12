@@ -86,6 +86,8 @@ class Trip(Base):
     status = Column(String(20), default="active", index=True)  # active, completed, cancelled
     last_call_triggered = Column(Boolean, default=False)
     last_call_date = Column(DateTime, nullable=True)
+    # Когда админу последний раз сообщили, что водитель молчит
+    silence_alert_at = Column(DateTime, nullable=True)
     
     # Telegram группа для уведомлений
     telegram_group_id = Column(String(50), nullable=True)
@@ -187,3 +189,14 @@ class DriverRegistration(Base):
     
     def __repr__(self):
         return f"<DriverRegistration {self.truck_number} ({self.status})>"
+
+
+
+class AppSetting(Base):
+    """Настройки, которые админ меняет из бота (ключ-значение)"""
+
+    __tablename__ = "app_settings"
+
+    key = Column(String(100), primary_key=True)
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -8,7 +8,11 @@ from aiogram.types import Update
 from loguru import logger
 from datetime import datetime
 
-from src.config import get_settings, TERMINALS
+from html import escape
+
+from src.config import get_settings, TERMINALS, terminal_name
+from src.services.notify import notify_admins
+from src.services.trips import apply_deal_to_trip, deal_link
 from src.db.database import get_session
 from src.db import crud
 from src.services.bitrix import bitrix_client
@@ -47,156 +51,169 @@ async def health_check():
 async def telegram_webhook(request: Request):
     """
     Webhook для получения обновлений от Telegram.
-    Используется в production (вместо long polling).
+    Всегда отвечаем 200: иначе Telegram будет бесконечно повторять «битое» обновление.
     """
     if not _bot or not _dp:
         logger.error("Bot or dispatcher not initialized")
-        raise HTTPException(status_code=500, detail="Bot not initialized")
+        raise HTTPException(status_code=503, detail="Bot not initialized")
     
     try:
         data = await request.json()
         update = Update(**data)
         await _dp.feed_update(_bot, update)
-        return {"ok": True}
     except Exception as e:
-        logger.error(f"Error processing Telegram webhook: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Error processing Telegram webhook: {e}")
+    return {"ok": True}
 
 
 # ==================== BITRIX24 WEBHOOK ====================
 
+async def _read_bitrix_payload(request: Request) -> dict:
+    """Битрикс шлёт form-urlencoded (data[FIELDS][ID]=…); на всякий случай понимаем и JSON."""
+    ctype = request.headers.get("content-type", "")
+    if "json" in ctype:
+        body = await request.json()
+        flat = {}
+        fields = (body.get("data") or {}).get("FIELDS") or {}
+        if fields.get("ID"):
+            flat["data[FIELDS][ID]"] = fields["ID"]
+        token = (body.get("auth") or {}).get("application_token")
+        if token:
+            flat["auth[application_token]"] = token
+        if body.get("document_id"):
+            flat["document_id[2]"] = body["document_id"][2] if isinstance(body["document_id"], list) else body["document_id"]
+        return flat
+    form = await request.form()
+    return dict(form)
+
+
 @router.post("/webhook/bitrix24/deal-update")
 async def bitrix_deal_update_webhook(request: Request):
     """
-    Webhook для обновлений сделок из Битрикс24.
-    Вызывается при изменении стадии сделки или других полей.
-    
-    Настройка в Битрикс24:
-    CRM → Настройки → Автоматизация → Роботы и триггеры
-    Добавить Webhook на событие "Изменение сделки"
+    Исходящий вебхук Битрикс24 (событие ONCRMDEALUPDATE).
+    - финальная стадия → завершаем рейс, сообщаем водителю и админам;
+    - активная сделка → обновляем привязанный рейс или привязываем ожидающую регистрацию.
     """
     try:
-        data = await request.form()
-        data = dict(data)
+        data = await _read_bitrix_payload(request)
         
-        # Извлекаем ID сделки
+        if settings.bitrix_app_token:
+            if data.get("auth[application_token]") != settings.bitrix_app_token:
+                logger.warning("Bitrix24 webhook: wrong application_token")
+                return {"status": "ok", "message": "ignored"}
+        
         deal_id = data.get("data[FIELDS][ID]") or data.get("document_id[2]")
+        if deal_id and str(deal_id).startswith("DEAL_"):
+            deal_id = str(deal_id).replace("DEAL_", "")
         
-        if not deal_id:
-            logger.warning(f"No deal ID in webhook data: {data}")
+        if not deal_id or not str(deal_id).isdigit():
+            logger.warning(f"No deal ID in webhook data: {list(data.keys())}")
             return {"status": "ok", "message": "No deal ID"}
         
         deal_id = int(deal_id)
         logger.info(f"Received Bitrix24 webhook for deal {deal_id}")
         
-        # Получаем полные данные сделки
         deal = await bitrix_client.get_deal(deal_id)
-        if not deal:
+        if not deal or not deal.get("ID"):
             logger.warning(f"Deal {deal_id} not found")
             return {"status": "ok", "message": "Deal not found"}
         
-        stage_id = deal.get("STAGE_ID", "")
+        stage_id = deal.get("STAGE_ID", "") or ""
         truck_number = (
-            deal.get(settings.bitrix_field_truck_number_alt) or
-            deal.get(settings.bitrix_field_truck_number, "")
-        )
+            deal.get(settings.bitrix_field_truck_number) or
+            deal.get(settings.bitrix_field_truck_number_alt) or ""
+        ).upper().replace(" ", "")
+        is_finished = stage_id in settings.bitrix_final_stages or deal.get("CLOSED") == "Y"
         
-        if not truck_number:
-            logger.debug(f"Deal {deal_id} has no truck number")
-            return {"status": "ok", "message": "No truck number"}
+        from src.bot.admin import trip_button
         
         async with get_session() as session:
-            # Проверяем, завершена ли сделка (груз прибыл)
-            is_finished = any(final in stage_id for final in settings.bitrix_final_stages)
+            # Рейс, уже привязанный к этой сделке
+            trip = await crud.get_active_trip_by_deal(session, deal_id)
             
             if is_finished:
-                # Ищем активный рейс и завершаем его
-                trip = await crud.get_active_trip_by_truck(session, truck_number)
+                if not trip and truck_number:
+                    trip = await crud.get_active_trip_by_truck(session, truck_number)
+                if not trip:
+                    return {"status": "ok", "message": "No active trip"}
                 
-                if trip:
-                    await crud.complete_trip(session, trip.id)
-                    
-                    # Уведомляем водителя
-                    driver = await crud.get_driver_by_telegram_id(session, trip.driver_id)
-                    if driver and _bot:
+                await crud.complete_trip(session, trip.id)
+                driver = await crud.get_driver_by_id(session, trip.driver_id)
+                if driver and _bot:
+                    try:
+                        await _bot.send_message(
+                            driver.telegram_id,
+                            "✅ <b>Перевозка завершена!</b>\n\n"
+                            "Груз прибыл на терминал. Отслеживание остановлено.\n\n"
+                            "Спасибо за работу! Для новой перевозки нажмите /start",
+                            reply_markup=keyboards.remove_keyboard(),
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to notify driver: {e}")
+                await notify_admins(
+                    "done",
+                    f"🏁 <b>Рейс завершён по стадии сделки</b> {escape(trip.truck_number)}\n"
+                    f"📋 {deal_link(deal_id, deal.get('TITLE'))}",
+                    trip_button(trip.id),
+                )
+                return {"status": "ok", "message": "Trip completed"}
+            
+            if trip:
+                # Обновляем данные рейса (терминал, даты, стадия)
+                apply_deal_to_trip(trip, deal)
+                return {"status": "ok", "message": "Trip updated"}
+            
+            if not truck_number:
+                return {"status": "ok", "message": "No truck number"}
+            
+            # Водитель, ожидающий сделку с этим номером
+            registration = await crud.find_waiting_registration(session, truck_number)
+            if registration:
+                driver = await crud.get_driver_by_telegram_id(session, registration.telegram_id)
+                waiting_trip = await crud.get_active_trip_by_driver(session, driver.id) if driver else None
+                
+                if waiting_trip and not waiting_trip.bitrix_deal_id:
+                    await crud.match_registration_with_deal(session, truck_number, deal_id)
+                    apply_deal_to_trip(waiting_trip, deal)
+                    await bitrix_client.update_driver_telegram_id(deal_id, registration.telegram_id)
+                    await bitrix_client.add_timeline_comment(
+                        deal_id, f"🚛 Водитель {truck_number} привязан к сделке Telegram-ботом отслеживания."
+                    )
+                    tname = terminal_name(waiting_trip.terminal_code)
+                    if _bot:
                         try:
                             await _bot.send_message(
-                                driver.telegram_id,
-                                "✅ <b>Перевозка завершена!</b>\n\n"
-                                "Груз прибыл на терминал. Отслеживание остановлено.\n\n"
-                                "Спасибо за работу! Для новой перевозки нажмите /start",
-                                reply_markup=keyboards.remove_keyboard(),
+                                registration.telegram_id,
+                                f"🎉 <b>Сделка найдена!</b>\n\n"
+                                f"📋 {escape(deal.get('TITLE') or 'Без названия')}\n"
+                                f"🏭 Терминал: {escape(tname)}\n\n"
+                                f"Теперь ваше местоположение будет передаваться брокеру.",
+                                reply_markup=keyboards.location_keyboard(),
                                 parse_mode="HTML"
                             )
-                            logger.info(f"Notified driver {driver.telegram_id} about trip completion")
                         except Exception as e:
-                            logger.error(f"Failed to notify driver: {e}")
-                    
-                    return {"status": "ok", "message": "Trip completed"}
+                            logger.error(f"Failed to notify driver about match: {e}")
+                    await notify_admins(
+                        "match",
+                        f"🔗 <b>Рейс привязан к сделке</b> {escape(truck_number)}\n"
+                        f"📋 {deal_link(deal_id, deal.get('TITLE'))}\n🏭 {escape(tname)}",
+                        trip_button(waiting_trip.id),
+                    )
+                    return {"status": "ok", "message": "Registration matched"}
             
-            else:
-                # Сделка активна — проверяем регистрации водителей
-                registration = await crud.find_waiting_registration(session, truck_number)
-                
-                if registration:
-                    # Есть водитель, ожидающий эту сделку
-                    await crud.match_registration_with_deal(session, truck_number, deal_id)
-                    
-                    # Получаем водителя и обновляем его рейс
-                    driver = await crud.get_driver_by_telegram_id(session, registration.telegram_id)
-                    
-                    if driver:
-                        trip = await crud.get_active_trip_by_driver(session, driver.id)
-                        
-                        if trip and not trip.bitrix_deal_id:
-                            terminal_code = deal.get(settings.bitrix_field_terminal)
-                            terminal_info = TERMINALS.get(terminal_code, {})
-                            
-                            # Обновляем данные рейса
-                            trip.bitrix_deal_id = deal_id
-                            trip.bitrix_deal_title = deal.get("TITLE")
-                            trip.bitrix_stage_id = stage_id
-                            trip.terminal_code = terminal_code
-                            trip.destination_address = terminal_info.get("address")
-                            trip.destination_lat = terminal_info.get("lat")
-                            trip.destination_lon = terminal_info.get("lon")
-                            
-                            # Записываем Telegram ID в сделку
-                            await bitrix_client.update_driver_telegram_id(
-                                deal_id,
-                                registration.telegram_id
-                            )
-                            
-                            # Уведомляем водителя
-                            if _bot:
-                                try:
-                                    await _bot.send_message(
-                                        registration.telegram_id,
-                                        f"🎉 <b>Сделка найдена!</b>\n\n"
-                                        f"📋 {deal.get('TITLE', 'Без названия')}\n"
-                                        f"🏭 Терминал: {terminal_code or 'Не указан'}\n\n"
-                                        f"Теперь ваше местоположение будет передаваться брокеру.",
-                                        reply_markup=keyboards.location_keyboard(),
-                                        parse_mode="HTML"
-                                    )
-                                    logger.info(f"Notified driver {registration.telegram_id} about deal match")
-                                except Exception as e:
-                                    logger.error(f"Failed to notify driver about match: {e}")
-                        
-                        return {"status": "ok", "message": "Registration matched"}
-                
-                # Проверяем, есть ли водитель с таким номером машины (без активной регистрации)
+            # Знакомый водитель без активного рейса — предлагаем начать отслеживание
+            if stage_id == settings.bitrix_stage_cargo_sent:
                 driver = await crud.get_driver_by_truck_number(session, truck_number)
-                
-                if driver and driver.consent_given:
-                    # Есть знакомый водитель — предлагаем начать отслеживание
-                    if _bot:
+                if driver and driver.consent_given and driver.is_active:
+                    active = await crud.get_active_trip_by_driver(session, driver.id)
+                    if not active and _bot:
                         try:
                             await _bot.send_message(
                                 driver.telegram_id,
                                 f"🚛 <b>Обнаружена новая перевозка!</b>\n\n"
-                                f"📋 {deal.get('TITLE', 'Без названия')}\n"
-                                f"🏭 Терминал: {deal.get(settings.bitrix_field_terminal) or 'Не указан'}\n\n"
+                                f"📋 {escape(deal.get('TITLE') or 'Без названия')}\n"
+                                f"🏭 Терминал: {escape(terminal_name(deal.get(settings.bitrix_field_terminal)))}\n\n"
                                 f"Начать отслеживание?",
                                 reply_markup=keyboards.start_trip_keyboard(deal_id),
                                 parse_mode="HTML"
@@ -208,7 +225,7 @@ async def bitrix_deal_update_webhook(request: Request):
         return {"status": "ok"}
         
     except Exception as e:
-        logger.error(f"Error processing Bitrix24 webhook: {e}")
+        logger.exception(f"Error processing Bitrix24 webhook: {e}")
         # Не возвращаем ошибку, чтобы Битрикс не пытался повторить
         return {"status": "error", "message": str(e)}
 

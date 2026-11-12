@@ -90,6 +90,8 @@ async def check_trips_and_update_days():
         for trip in trips:
             if trip.shipment_date:
                 days = (datetime.utcnow() - trip.shipment_date).days
+                if days == trip.days_in_transit:
+                    continue
                 trip.days_in_transit = days
                 
                 # Обновляем в Битрикс24 если есть связь со сделкой
@@ -132,7 +134,7 @@ async def check_last_call_triggers():
             
             # Триггер по расстоянию (если есть последняя локация)
             if not should_trigger and trip.terminal_code:
-                last_location = await crud.get_last_location(session, trip.driver_id)
+                last_location = await crud.get_last_trip_location(session, trip)
                 if last_location:
                     route_info = await maps_service.get_distance_to_terminal(
                         last_location.latitude,
@@ -146,7 +148,7 @@ async def check_last_call_triggers():
             if should_trigger:
                 try:
                     # Получаем водителя
-                    driver = await crud.get_driver_by_telegram_id(session, trip.driver_id)
+                    driver = await crud.get_driver_by_id(session, trip.driver_id)
                     if driver:
                         await _bot.send_message(
                             driver.telegram_id,
@@ -160,6 +162,16 @@ async def check_last_call_triggers():
                         trip.last_call_date = datetime.utcnow()
                         
                         logger.info(f"Last call triggered for trip {trip.id}: {trigger_reason}")
+                        
+                        from src.services.notify import notify_admins
+                        from src.services.trips import deal_link
+                        from src.bot.admin import trip_button
+                        await notify_admins(
+                            "lastcall",
+                            f"🏁 <b>Last call</b> {trip.truck_number}: {trigger_reason}\n"
+                            f"📋 {deal_link(trip.bitrix_deal_id, trip.bitrix_deal_title)}",
+                            trip_button(trip.id),
+                        )
                 
                 except Exception as e:
                     logger.error(f"Failed to send last call to trip {trip.id}: {e}")
@@ -167,6 +179,44 @@ async def check_last_call_triggers():
         await session.commit()
     
     logger.info("Last call check job completed")
+
+
+async def check_silent_drivers():
+    """Сообщить админам о рейсах без геопозиции дольше SILENCE_HOURS (один раз за период молчания)."""
+    from datetime import timedelta
+    from src.services.notify import notify_admins
+    from src.services.trips import ago, deal_link
+    from src.bot.admin import trip_button
+    
+    border = datetime.utcnow() - timedelta(hours=settings.silence_hours)
+    async with get_session() as session:
+        for trip in await crud.list_active_trips(session):
+            loc = await crud.get_last_trip_location(session, trip)
+            last_seen = loc.recorded_at if loc else trip.started_at
+            if not last_seen or last_seen > border:
+                continue
+            if trip.silence_alert_at and trip.silence_alert_at > last_seen:
+                continue  # уже сообщали за этот период молчания
+            trip.silence_alert_at = datetime.utcnow()
+            await notify_admins(
+                "silence",
+                f"🔕 <b>Водитель молчит</b> {trip.truck_number}: последняя точка {ago(loc.recorded_at) if loc else 'не было ни одной'}\n"
+                f"📋 {deal_link(trip.bitrix_deal_id, trip.bitrix_deal_title)}",
+                trip_button(trip.id),
+            )
+
+
+async def admin_daily_digest():
+    """Утренняя сводка админам."""
+    from src.services.notify import notify_admins
+    from src.bot.admin import _summary_text
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    async with get_session() as session:
+        if not await crud.list_active_trips(session):
+            return
+        text = await _summary_text(session)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛠 Открыть админку", callback_data="adm:menu")]])
+    await notify_admins("digest", "☀️ " + text, kb)
 
 
 def start_scheduler():
@@ -203,8 +253,26 @@ def start_scheduler():
         name="Last call triggers check"
     )
     
+    # Молчащие водители (каждый час)
+    scheduler.add_job(
+        check_silent_drivers,
+        CronTrigger(minute=15, timezone="UTC"),
+        id="silent_drivers_check",
+        replace_existing=True,
+        name="Silent drivers check"
+    )
+    
+    # Утренняя сводка админам
+    scheduler.add_job(
+        admin_daily_digest,
+        CronTrigger(hour=settings.admin_digest_hour, minute=5, timezone="UTC"),
+        id="admin_daily_digest",
+        replace_existing=True,
+        name="Admin daily digest"
+    )
+    
     scheduler.start()
-    logger.info("Scheduler started with jobs: daily_location_request, daily_trips_update, last_call_check")
+    logger.info("Scheduler started with jobs: daily_location_request, daily_trips_update, last_call_check, silent_drivers_check, admin_daily_digest")
 
 
 def stop_scheduler():

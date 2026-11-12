@@ -4,7 +4,7 @@ CRUD операции для работы с базой данных.
 
 from datetime import datetime, timedelta
 from typing import Optional, List
-from sqlalchemy import select, update, and_, or_
+from sqlalchemy import select, update, and_, or_, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
@@ -29,9 +29,9 @@ async def get_driver_by_truck_number(session: AsyncSession, truck_number: str) -
                 Driver.truck_number == truck_number.upper(),
                 Driver.is_active == True
             )
-        )
+        ).order_by(Driver.updated_at.desc()).limit(1)
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 async def create_driver(
@@ -131,9 +131,9 @@ async def get_active_trip_by_truck(session: AsyncSession, truck_number: str) -> 
                 Trip.truck_number == truck_number.upper(),
                 Trip.status == "active"
             )
-        ).order_by(Trip.created_at.desc())
+        ).order_by(Trip.created_at.desc()).limit(1)
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 async def get_active_trip_by_driver(session: AsyncSession, driver_id: int) -> Optional[Trip]:
@@ -144,9 +144,9 @@ async def get_active_trip_by_driver(session: AsyncSession, driver_id: int) -> Op
                 Trip.driver_id == driver_id,
                 Trip.status == "active"
             )
-        ).order_by(Trip.created_at.desc())
+        ).order_by(Trip.created_at.desc()).limit(1)
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 async def update_trip_from_bitrix(
@@ -272,7 +272,7 @@ async def create_driver_registration(
             )
         )
     )
-    existing_reg = existing.scalar_one_or_none()
+    existing_reg = existing.scalars().first()
     
     if existing_reg:
         # Обновляем существующую
@@ -306,9 +306,9 @@ async def find_waiting_registration(
                 DriverRegistration.truck_number == truck_number.upper(),
                 DriverRegistration.status == "waiting"
             )
-        )
+        ).order_by(DriverRegistration.created_at.desc()).limit(1)
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 async def match_registration_with_deal(
@@ -346,3 +346,94 @@ async def update_registration_location(
             updated_at=datetime.utcnow()
         )
     )
+
+
+
+# ==================== ДЛЯ АДМИНКИ ====================
+
+async def get_driver_by_id(session: AsyncSession, driver_id: int) -> Optional[Driver]:
+    """Получить водителя по внутреннему ID (не Telegram ID)"""
+    result = await session.execute(select(Driver).where(Driver.id == driver_id))
+    return result.scalar_one_or_none()
+
+
+async def get_trip_by_id(session: AsyncSession, trip_id: int) -> Optional[Trip]:
+    result = await session.execute(select(Trip).where(Trip.id == trip_id))
+    return result.scalar_one_or_none()
+
+
+async def get_last_trip_location(session: AsyncSession, trip: Trip) -> Optional[Location]:
+    """Последняя точка по рейсу (если нет — последняя точка водителя после старта рейса)"""
+    result = await session.execute(
+        select(Location)
+        .where(or_(
+            Location.trip_id == trip.id,
+            and_(Location.driver_id == trip.driver_id, Location.recorded_at >= trip.started_at),
+        ))
+        .order_by(Location.recorded_at.desc())
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+async def list_active_trips(session: AsyncSession, linked: Optional[bool] = None) -> List[Trip]:
+    """Активные рейсы; linked=True — со сделкой, False — без сделки"""
+    q = select(Trip).where(Trip.status == "active")
+    if linked is True:
+        q = q.where(Trip.bitrix_deal_id.isnot(None))
+    elif linked is False:
+        q = q.where(Trip.bitrix_deal_id.is_(None))
+    result = await session.execute(q.order_by(Trip.started_at.desc()))
+    return list(result.scalars().all())
+
+
+async def list_drivers(session: AsyncSession) -> List[Driver]:
+    result = await session.execute(select(Driver).order_by(Driver.updated_at.desc()))
+    return list(result.scalars().all())
+
+
+async def list_driver_trips(session: AsyncSession, driver_id: int, limit: int = 5) -> List[Trip]:
+    result = await session.execute(
+        select(Trip).where(Trip.driver_id == driver_id).order_by(Trip.started_at.desc()).limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def count_trips(session: AsyncSession, driver_id: int) -> int:
+    result = await session.execute(select(func.count(Trip.id)).where(Trip.driver_id == driver_id))
+    return int(result.scalar() or 0)
+
+
+async def get_active_trip_by_deal(session: AsyncSession, deal_id: int) -> Optional[Trip]:
+    result = await session.execute(
+        select(Trip).where(and_(Trip.bitrix_deal_id == deal_id, Trip.status == "active"))
+        .order_by(Trip.created_at.desc()).limit(1)
+    )
+    return result.scalars().first()
+
+
+async def cancel_waiting_registrations(session: AsyncSession, telegram_id: int):
+    """Закрыть ожидающие регистрации водителя (после ручной привязки или завершения)"""
+    await session.execute(
+        update(DriverRegistration)
+        .where(and_(DriverRegistration.telegram_id == telegram_id, DriverRegistration.status == "waiting"))
+        .values(status="matched", matched_at=datetime.utcnow())
+    )
+
+
+async def get_setting(session: AsyncSession, key: str, default: Optional[str] = None) -> Optional[str]:
+    from src.db.models import AppSetting
+    result = await session.execute(select(AppSetting).where(AppSetting.key == key))
+    row = result.scalar_one_or_none()
+    return row.value if row else default
+
+
+async def set_setting(session: AsyncSession, key: str, value: str):
+    from src.db.models import AppSetting
+    result = await session.execute(select(AppSetting).where(AppSetting.key == key))
+    row = result.scalar_one_or_none()
+    if row:
+        row.value = value
+    else:
+        session.add(AppSetting(key=key, value=value))
+    await session.flush()

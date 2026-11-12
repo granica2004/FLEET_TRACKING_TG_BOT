@@ -16,7 +16,7 @@ class Bitrix24Client:
     """Асинхронный клиент Битрикс24 REST API"""
     
     def __init__(self, webhook_url: Optional[str] = None):
-        self.base_url = (webhook_url or settings.bitrix24_webhook_url).rstrip("/")
+        self.base_url = (webhook_url or settings.bitrix_rest_url).rstrip("/")
         self.timeout = httpx.Timeout(30.0)
     
     async def _request(self, method: str, params: Optional[Dict] = None) -> Dict[str, Any]:
@@ -44,6 +44,7 @@ class Bitrix24Client:
     async def find_deal_by_truck_number(self, truck_number: str) -> Optional[Dict[str, Any]]:
         """
         Найти активную сделку по номеру машины.
+        Ищет в стадиях: NEW (Новая) и UC_SDO64X (Груз отправлен).
         Проверяет два поля: основное и альтернативное.
         """
         truck_clean = truck_number.upper().replace(" ", "")
@@ -62,7 +63,42 @@ class Bitrix24Client:
             settings.bitrix_field_telegram_group,
         ]
         
-        # Поиск по основному полю
+        # Стадии для поиска: Новая и Груз отправлен
+        stages_to_search = ["NEW", settings.bitrix_stage_cargo_sent]
+        
+        for stage in stages_to_search:
+            # Поиск по основному полю
+            result = await self._request("crm.deal.list", {
+                "filter": {
+                    settings.bitrix_field_truck_number: truck_clean,
+                    "STAGE_ID": stage,
+                    "CLOSED": "N"
+                },
+                "select": select_fields,
+                "order": {"DATE_MODIFY": "DESC"}
+            })
+            
+            if result:
+                logger.info(f"Found deal by primary field in stage {stage}: {result[0]['ID']}")
+                return result[0]
+            
+            # Поиск по альтернативному полю
+            result = await self._request("crm.deal.list", {
+                "filter": {
+                    settings.bitrix_field_truck_number_alt: truck_clean,
+                    "STAGE_ID": stage,
+                    "CLOSED": "N"
+                },
+                "select": select_fields,
+                "order": {"DATE_MODIFY": "DESC"}
+            })
+            
+            if result:
+                logger.info(f"Found deal by alt field in stage {stage}: {result[0]['ID']}")
+                return result[0]
+        
+        # Если не нашли по конкретным стадиям — ищем по любой открытой сделке
+        # Поиск по основному полю (любая открытая)
         result = await self._request("crm.deal.list", {
             "filter": {
                 settings.bitrix_field_truck_number: truck_clean,
@@ -73,10 +109,10 @@ class Bitrix24Client:
         })
         
         if result:
-            logger.info(f"Found deal by primary field: {result[0]['ID']}")
+            logger.info(f"Found deal by primary field (any open): {result[0]['ID']}")
             return result[0]
         
-        # Поиск по альтернативному полю
+        # Поиск по альтернативному полю (любая открытая)
         result = await self._request("crm.deal.list", {
             "filter": {
                 settings.bitrix_field_truck_number_alt: truck_clean,
@@ -87,7 +123,7 @@ class Bitrix24Client:
         })
         
         if result:
-            logger.info(f"Found deal by alt field: {result[0]['ID']}")
+            logger.info(f"Found deal by alt field (any open): {result[0]['ID']}")
             return result[0]
         
         # Поиск с частичным совпадением (если номер содержит / для тягач/прицеп)

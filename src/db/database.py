@@ -3,6 +3,7 @@
 """
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy import text
 from sqlalchemy.pool import NullPool
 from contextlib import asynccontextmanager
 from loguru import logger
@@ -34,6 +35,11 @@ async def init_db():
     """Инициализация базы данных (создание таблиц)"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Новые колонки в существующих таблицах (create_all их не добавляет)
+        if conn.dialect.name == "postgresql":
+            await conn.execute(text(
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS silence_alert_at TIMESTAMP"
+            ))
     logger.info("Database initialized")
 
 
