@@ -26,6 +26,8 @@ from src.db.database import get_session
 from src.services.bitrix import bitrix_client
 from src.services.notify import EVENT_TITLES, is_admin
 from src.services import access, events
+from src import i18n
+from src.services.deal_sync import announce_link
 from src.services.trips import (
     ago, apply_deal_to_trip, deal_link, driver_label, msk,
 )
@@ -186,7 +188,7 @@ async def driver_card(session, driver_id: int):
     last = await crud.get_last_location(session, d.id)
     lines = [
         f"👤 <b>{driver_label(d)}</b>",
-        f"🆔 Telegram: <code>{d.telegram_id}</code>",
+        f"🆔 Telegram: <code>{d.telegram_id}</code> · 🌐 {i18n.LANG_NAMES[await i18n.get_lang(d.telegram_id)]}",
         f"🚛 Тягач: {escape(d.truck_number or '—')}",
         f"✅ Согласие: {msk(d.consent_date, '%d.%m.%Y') if d.consent_given else 'нет'}",
         f"📅 В боте с {msk(d.created_at, '%d.%m.%Y')}",
@@ -317,11 +319,11 @@ async def cb_ask_location(cb: CallbackQuery):
         await cb.answer("Водитель не найден", show_alert=True)
         return
     try:
+        lang = await i18n.get_lang(driver.telegram_id)
         await cb.bot.send_message(
             driver.telegram_id,
-            "📍 Диспетчер просит отправить текущее местоположение.\n"
-            "Нажмите кнопку «📍 Отправить местоположение» внизу.",
-            reply_markup=keyboards.location_keyboard(),
+            i18n.t(lang, "dispatcher_asks_location", btn=i18n.t(lang, "btn_send_location")),
+            reply_markup=keyboards.location_keyboard(lang),
         )
         await cb.answer("Запрос отправлен водителю", show_alert=True)
     except Exception as e:
@@ -404,25 +406,21 @@ async def st_bind_deal(message: Message, state: FSMContext):
 async def _bind(bot, session, trip, deal: dict):
     """Привязать рейс к сделке: поля рейса, Telegram ID в сделку, комментарий, сообщение водителю."""
     apply_deal_to_trip(trip, deal)
-    driver = await crud.get_driver_by_id(session, trip.driver_id)
+    driver = await crud.get_driver_by_id(session, trip.driver_id) if trip.driver_id else None
     await session.flush()
     if driver:
         await crud.cancel_waiting_registrations(session, driver.telegram_id)
         await bitrix_client.update_driver_telegram_id(trip.bitrix_deal_id, driver.telegram_id, driver.username)
-    await bitrix_client.add_timeline_comment(
-        trip.bitrix_deal_id,
-        f"🚛 Диспетчер привязал рейс {trip.truck_number} к сделке в Telegram-боте отслеживания.",
-    )
+    await announce_link(session, trip, driver, "диспетчер привязал рейс вручную по ID сделки")
     await events.on_trip_started(session, trip)
     if driver:
         try:
+            lang = await i18n.get_lang(driver.telegram_id)
             await bot.send_message(
                 driver.telegram_id,
-                f"✅ <b>Перевозка привязана к заказу</b>\n\n"
-                f"📋 {escape(trip.bitrix_deal_title or '')}\n"
-                f"🏭 Терминал: {escape(terminal_name(trip.terminal_code))}\n\n"
-                f"Теперь ваше местоположение передаётся брокеру.",
-                reply_markup=keyboards.location_keyboard(), parse_mode="HTML",
+                i18n.t(lang, "bound_by_dispatcher", title=escape(trip.bitrix_deal_title or ""),
+                       terminal=escape(i18n.terminal_name(lang, trip.terminal_code))),
+                reply_markup=keyboards.location_keyboard(lang), parse_mode="HTML",
             )
         except Exception as e:
             logger.warning(f"Cannot notify driver about bind: {e}")
@@ -445,7 +443,7 @@ async def cb_finish(cb: CallbackQuery):
         t = await crud.get_trip_by_id(session, trip_id)
         if t and t.status == "active":
             await crud.complete_trip(session, t.id)
-            driver = await crud.get_driver_by_id(session, t.driver_id)
+            driver = await crud.get_driver_by_id(session, t.driver_id) if t.driver_id else None
             if t.bitrix_deal_id:
                 await bitrix_client.add_timeline_comment(
                     t.bitrix_deal_id, "🏁 Диспетчер завершил отслеживание рейса в Telegram-боте.")
@@ -454,8 +452,7 @@ async def cb_finish(cb: CallbackQuery):
                 try:
                     await cb.bot.send_message(
                         driver.telegram_id,
-                        "✅ Перевозка завершена диспетчером. Отслеживание остановлено.\n"
-                        "Для новой перевозки нажмите /start",
+                        i18n.t(await i18n.get_lang(driver.telegram_id), "done_by_dispatcher"),
                         reply_markup=keyboards.remove_keyboard(),
                     )
                 except Exception as e:
@@ -489,7 +486,8 @@ async def st_msg_driver(message: Message, state: FSMContext):
         await message.answer("Водитель не найден.")
         return
     try:
-        await message.bot.send_message(d.telegram_id, f"✉️ <b>Сообщение от диспетчера:</b>\n\n{escape(message.text)}",
+        lang = await i18n.get_lang(d.telegram_id)
+        await message.bot.send_message(d.telegram_id, i18n.t(lang, "msg_from_dispatcher", text=escape(message.text)),
                                        parse_mode="HTML")
         await message.answer(f"✅ Отправлено: {driver_label(d)}", parse_mode="HTML", reply_markup=menu_kb())
     except Exception as e:
@@ -663,6 +661,7 @@ async def participant_card(session, pid: int, viewer_id: int):
     if p.inn:
         lines.append(f"ИНН: {p.inn}")
     lines.append(f"🆔 <code>{p.telegram_id}</code> · с {msk(p.created_at, '%d.%m.%Y')}")
+    lines.append(f"🌐 {i18n.LANG_NAMES[await i18n.get_lang(p.telegram_id)]}")
     if p.role in ("client", "broker") and p.status == "active":
         n = len(await access.trips_for_user(session, p.telegram_id))
         lines.append(f"📦 Видит рейсов (активные и за 30 дней): {n}")
@@ -712,12 +711,13 @@ async def cb_participant_decide(cb: CallbackQuery):
         role, tg = p.role, p.telegram_id
         text, kb = await participant_card(session, p.id, cb.from_user.id)
     try:
+        lang = await i18n.get_lang(tg)
         if decision == "ok":
             from src.bot.roles import menu_for
-            await cb.bot.send_message(tg, "✅ Доступ открыт. «📦 Мои рейсы» — где сейчас машины.",
-                                      reply_markup=menu_for(role))
+            await cb.bot.send_message(tg, i18n.t(lang, "access_opened", my=i18n.t(lang, "btn_my_trips")),
+                                      reply_markup=menu_for(role, lang))
         else:
-            await cb.bot.send_message(tg, "К сожалению, в доступе отказано. Свяжитесь с диспетчером.")
+            await cb.bot.send_message(tg, i18n.t(lang, "access_denied"))
     except Exception as e:
         logger.warning(f"Cannot notify participant {tg}: {e}")
     await _edit(cb, text, kb)
@@ -765,8 +765,9 @@ async def cb_make_admin(cb: CallbackQuery):
         tg, role = p.telegram_id, p.role
     try:
         from src.bot.roles import menu_for
-        await cb.bot.send_message(tg, "⭐ Вам открыта админка — /admin" if role == "admin"
-                                  else "Права админа сняты.", reply_markup=menu_for(role))
+        lang = await i18n.get_lang(tg)
+        await cb.bot.send_message(tg, i18n.t(lang, "admin_granted") if role == "admin"
+                                  else i18n.t(lang, "admin_revoked"), reply_markup=menu_for(role, lang))
     except Exception:
         pass
     await _edit(cb, text, kb)
@@ -814,7 +815,8 @@ async def st_msg_participant(message: Message, state: FSMContext):
         await message.answer("Не найден.")
         return
     try:
-        await message.bot.send_message(p.telegram_id, f"✉️ <b>Сообщение от диспетчера:</b>\n\n{escape(message.text)}",
+        lang = await i18n.get_lang(p.telegram_id)
+        await message.bot.send_message(p.telegram_id, i18n.t(lang, "msg_from_dispatcher", text=escape(message.text)),
                                        parse_mode="HTML")
         await message.answer(f"✅ Отправлено: {escape(p.full_name or '')}", reply_markup=menu_kb())
     except Exception as e:
@@ -871,9 +873,10 @@ async def cb_access_toggle(cb: CallbackQuery):
         truck = t.truck_number
     if opened and p:
         try:
+            lang = await i18n.get_lang(p.telegram_id)
             await cb.bot.send_message(
-                p.telegram_id, f"🚛 Вам открыт рейс {escape(truck)}.",
-                reply_markup=events.view_button(int(trip_id)), parse_mode="HTML")
+                p.telegram_id, i18n.t(lang, "trip_opened_to_you", truck=escape(truck)),
+                reply_markup=events.view_button(int(trip_id), lang), parse_mode="HTML")
         except Exception:
             pass
     await _edit(cb, text, kb)

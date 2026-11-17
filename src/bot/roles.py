@@ -1,7 +1,8 @@
 """
-Роли: выбор роли при /start, регистрация клиента и брокера, приглашения,
+Роли: выбор языка и роли при /start, регистрация клиента и брокера, приглашения,
 «Мои рейсы» (карточка, где сейчас, история, карта маршрута),
 создание рейса брокером/админом и подключение водителя по ссылке.
+Тексты — на языке пользователя (src/i18n.py); уведомления админам — на русском.
 """
 
 from datetime import datetime
@@ -13,19 +14,20 @@ from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from loguru import logger
 
+from src import i18n
 from src.bot import keyboards
-from src.config import TERMINALS, get_settings, terminal_name
+from src.config import get_settings
 from src.db import crud
 from src.db.database import get_session
+from src.i18n import V, t
 from src.services import access, events
 from src.services.bitrix import bitrix_client
+from src.services.deal_sync import announce_link
 from src.services.notify import notify_admins
-from src.services.trips import ago, apply_deal_to_trip, msk
+from src.services.trips import apply_deal_to_trip, msk
 
 settings = get_settings()
 router = Router(name="roles")
@@ -77,13 +79,13 @@ class CanCreateTrip(BaseFilter):
         return bool(p and p.status == "active" and p.role == "broker")
 
 
-def menu_for(role: Optional[str]):
+def menu_for(role: Optional[str], lang: str = "ru"):
     if role in ("owner", "admin"):
         return keyboards.admin_menu()
     if role == "broker":
-        return keyboards.broker_menu()
+        return keyboards.broker_menu(lang)
     if role == "client":
-        return keyboards.client_menu()
+        return keyboards.client_menu(lang)
     return None
 
 
@@ -94,25 +96,50 @@ def admin_pp_kb(pid: int) -> InlineKeyboardMarkup:
     ], [InlineKeyboardButton(text="👤 Карточка", callback_data=f"adm:p:{pid}")]])
 
 
+def _card_kb(pid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="👤 Карточка", callback_data=f"adm:p:{pid}")]])
+
+
+# ==================== ЯЗЫК ====================
+
+@router.message(Command("language"))
+async def cmd_language(message: Message, state: FSMContext):
+    await message.answer(t("ru", "lang_choose"), reply_markup=keyboards.language_keyboard())
+
+
+@router.callback_query(F.data.startswith("lang:"))
+async def cb_language(cb: CallbackQuery, state: FSMContext):
+    lang = i18n.norm(cb.data.split(":")[1])
+    await i18n.set_lang(cb.from_user.id, lang)
+    await cb.answer(t(lang, "lang_set"))
+    try:
+        await cb.message.edit_text(t(lang, "lang_set"))
+    except Exception:
+        pass
+    await state.clear()
+    await run_start(cb.message, state, lang, cb.from_user)
+
+
 # ==================== /start С ПРИГЛАШЕНИЕМ ====================
 
 @router.message(CommandStart(deep_link=True))
-async def start_with_link(message: Message, command: CommandObject, state: FSMContext):
+async def start_with_link(message: Message, command: CommandObject, state: FSMContext, lang: str = "ru"):
     payload = (command.args or "").strip()
     if payload.startswith("inv_"):
-        await _accept_role_invite(message, state, payload[4:])
+        await _accept_role_invite(message, state, payload[4:], lang)
     elif payload.startswith("drv_"):
-        await _accept_driver_invite(message, state, payload[4:])
+        await _accept_driver_invite(message, state, payload[4:], lang)
     else:
         raise SkipHandler()
 
 
-async def _accept_role_invite(message: Message, state: FSMContext, code: str):
+async def _accept_role_invite(message: Message, state: FSMContext, code: str, lang: str):
     await state.clear()
     async with get_session() as session:
         inv = await access.get_invite(session, code)
         if not inv or inv.kind not in ("broker", "admin"):
-            await message.answer("Ссылка недействительна или уже использована. Попросите новую у диспетчера.")
+            await message.answer(t(lang, "invite_invalid"))
             return
         u = message.from_user
         p = await access.upsert_participant(
@@ -122,30 +149,27 @@ async def _accept_role_invite(message: Message, state: FSMContext, code: str):
         inv.used_at = datetime.utcnow()
         if inv.kind == "admin":
             await access.reload_admins(session)
-        pid = p.id
-    title = access.ROLE_TITLES[inv.kind]
-    await notify_admins("people", f"👤 По приглашению подключился <b>{escape(u.full_name)}</b> — {title}",
-                        InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="👤 Карточка", callback_data=f"adm:p:{pid}")]]))
-    if inv.kind == "admin":
-        await message.answer("✅ Вы подключены как менеджер. Панель управления — /admin",
-                             reply_markup=keyboards.admin_menu())
+        pid, kind = p.id, inv.kind
+    await notify_admins("people", f"👤 По приглашению подключился <b>{escape(u.full_name)}</b> — "
+                                  f"{access.ROLE_TITLES[kind]}", _card_kb(pid))
+    if kind == "admin":
+        await message.answer(t(lang, "joined_manager"), reply_markup=keyboards.admin_menu())
     else:
         await message.answer(
-            "✅ Вы подключены как отправитель / брокер.\n\n"
-            "«➕ Новый рейс» — создать рейс и получить ссылку для водителя.\n"
-            "«📦 Мои рейсы» — где сейчас машины и их маршрут.",
-            reply_markup=keyboards.broker_menu(),
+            t(lang, "joined_broker", new=t(lang, "btn_create_trip"), my=t(lang, "btn_my_trips"))
+            + "\n\n" + t(lang, "lang_hint"),
+            reply_markup=keyboards.broker_menu(lang),
         )
 
 
-async def _accept_driver_invite(message: Message, state: FSMContext, code: str):
+async def _accept_driver_invite(message: Message, state: FSMContext, code: str, lang: str):
     from src.bot.handlers import send_consent_request
+    from src.bot.states import RegistrationStates
     async with get_session() as session:
         inv = await access.get_invite(session, code)
         trip = await crud.get_trip_by_id(session, inv.trip_id) if inv and inv.kind == "driver" else None
         if not trip or trip.status != "active":
-            await message.answer("Ссылка недействительна или рейс уже завершён. Обратитесь к диспетчеру.")
+            await message.answer(t(lang, "invite_invalid_driver"))
             return
         u = message.from_user
         driver = await crud.get_driver_by_telegram_id(session, u.id)
@@ -153,37 +177,32 @@ async def _accept_driver_invite(message: Message, state: FSMContext, code: str):
             driver = await crud.create_driver(session, telegram_id=u.id, username=u.username,
                                               first_name=u.first_name, last_name=u.last_name)
         if not driver.is_active:
-            await message.answer("⛔ Доступ к боту закрыт. Обратитесь к диспетчеру.")
+            await message.answer(t(lang, "blocked"))
             return
         inv.used_by = u.id
         inv.used_at = datetime.utcnow()
+        text = None
         if driver.consent_given:
-            await attach_driver(session, message.bot, driver, trip)
-            text = await driver_trip_text(trip)
-        else:
-            text = None
+            await attach_driver(session, message.bot, driver, trip, how="водитель открыл ссылку-приглашение")
+            text = driver_trip_text(lang, trip)
         trip_id = trip.id
     if text:
-        from src.bot.states import RegistrationStates
         await state.set_state(RegistrationStates.active_trip)
-        await message.answer(text, reply_markup=keyboards.location_keyboard(), parse_mode="HTML")
+        await message.answer(text, reply_markup=keyboards.location_keyboard(lang), parse_mode="HTML")
     else:
         await state.update_data(invite_trip_id=trip_id)
-        await send_consent_request(message, state)
+        await send_consent_request(message, state, lang)
+        await message.answer(t(lang, "lang_hint"))
 
 
-async def driver_trip_text(trip) -> str:
-    t = TERMINALS.get(str(trip.terminal_code or ""), {})
-    return (
-        f"✅ <b>Вы подключены к рейсу</b>\n\n"
-        f"🚛 {escape(trip.truck_number)}\n"
-        f"🏭 Терминал: {escape(terminal_name(trip.terminal_code))}\n"
-        + (f"🏠 {escape(t['address_ru'])}\n" if t.get("address_ru") else "")
-        + "\nНажмите «📍 Отправить местоположение»."
-    )
+def driver_trip_text(lang: str, trip) -> str:
+    addr = i18n.terminal_address(lang, trip.terminal_code)
+    return t(lang, "attached_to_trip", truck=escape(trip.truck_number),
+             terminal=escape(i18n.terminal_name(lang, trip.terminal_code)),
+             address=(f"🏠 {escape(addr)}\n" if addr else ""), btn=t(lang, "btn_send_location"))
 
 
-async def attach_driver(session, bot, driver, trip):
+async def attach_driver(session, bot, driver, trip, how: str = "водитель подключился к рейсу"):
     """Подключить водителя к рейсу (по ссылке или по совпадению номера)."""
     old = await crud.get_active_trip_by_driver(session, driver.id)
     if old and old.id != trip.id:
@@ -195,8 +214,7 @@ async def attach_driver(session, bot, driver, trip):
     await crud.cancel_waiting_registrations(session, driver.telegram_id)
     if trip.bitrix_deal_id:
         await bitrix_client.update_driver_telegram_id(trip.bitrix_deal_id, driver.telegram_id, driver.username)
-        await bitrix_client.add_timeline_comment(
-            trip.bitrix_deal_id, f"🚛 Водитель подключился к рейсу {trip.truck_number} в Telegram-боте.")
+        await announce_link(session, trip, driver, how)
     from src.services.trips import driver_label
     await notify_admins("match", f"🔗 <b>Водитель подключился к рейсу</b> {escape(trip.truck_number)}: "
                                  f"{driver_label(driver)}",
@@ -209,8 +227,17 @@ async def attach_driver(session, bot, driver, trip):
 # ==================== /start БЕЗ ПРИГЛАШЕНИЯ ====================
 
 @router.message(CommandStart())
-async def start_by_role(message: Message, state: FSMContext):
-    uid = message.from_user.id
+async def start_by_role(message: Message, state: FSMContext, lang: str = "ru"):
+    if await i18n.stored_lang(message.from_user.id) is None:
+        await state.clear()
+        await message.answer(t(lang, "lang_choose"), reply_markup=keyboards.language_keyboard())
+        return
+    await run_start(message, state, lang, message.from_user)
+
+
+async def run_start(message: Message, state: FSMContext, lang: str, user):
+    """Приветствие по роли. message — куда отвечать, user — кто нажал."""
+    uid = user.id
     async with get_session() as session:
         p = await access.get_participant(session, uid)
         driver = await crud.get_driver_by_telegram_id(session, uid)
@@ -220,65 +247,59 @@ async def start_by_role(message: Message, state: FSMContext):
         await state.clear()
         await message.answer(
             f"🛠 <b>Вы админ.</b> Рейсов в работе и за 30 дней: {n_trips}.\n"
-            f"/admin — панель управления, /driver — проверить бот глазами водителя.",
+            f"/admin — панель управления, /driver — проверить бот глазами водителя, /language — язык.",
             reply_markup=keyboards.admin_menu(), parse_mode="HTML",
         )
         return
     if p:
         await state.clear()
         if p.status == "blocked":
-            await message.answer("⛔ Доступ к боту закрыт. Обратитесь к диспетчеру.",
-                                 reply_markup=keyboards.remove_keyboard())
+            await message.answer(t(lang, "blocked"), reply_markup=keyboards.remove_keyboard())
         elif p.status == "pending":
-            await message.answer("⏳ Ваша заявка на рассмотрении у диспетчера. Мы сообщим, когда доступ откроется.")
+            await message.answer(t(lang, "pending_wait"))
         else:
             who = escape(p.company_title or p.full_name or "")
             await message.answer(
-                f"👋 Здравствуйте{', ' + who if who else ''}!\nРейсов: {n_trips}. «📦 Мои рейсы» — список.",
-                reply_markup=menu_for(p.role),
+                t(lang, "greet", who=(", " + who) if who else "", n=n_trips, my=t(lang, "btn_my_trips")),
+                reply_markup=menu_for(p.role, lang),
             )
         return
     if driver:
-        raise SkipHandler()  # обычный сценарий водителя
+        from src.bot.handlers import cmd_start
+        await cmd_start(message, state, lang, user=user)
+        return
     await state.clear()
-    await message.answer(
-        "🚛 <b>Бот отслеживания грузов ГРАНИЦА 2004</b>\n\nКто вы?",
-        reply_markup=keyboards.role_choice_keyboard(), parse_mode="HTML",
-    )
+    await message.answer(t(lang, "who_are_you"), reply_markup=keyboards.role_choice_keyboard(lang), parse_mode="HTML")
 
 
 @router.message(Command("driver"))
-async def as_driver(message: Message, state: FSMContext):
+async def as_driver(message: Message, state: FSMContext, lang: str = "ru"):
     from src.bot.handlers import cmd_start
-    await cmd_start(message, state)
+    await cmd_start(message, state, lang)
 
 
-@router.message(F.text == "🚛 Я водитель")
-async def choose_driver(message: Message, state: FSMContext):
+@router.message(F.text.in_(V("btn_role_driver")))
+async def choose_driver(message: Message, state: FSMContext, lang: str = "ru"):
     from src.bot.handlers import cmd_start
-    await cmd_start(message, state)
+    await cmd_start(message, state, lang)
 
 
-@router.message(F.text == "📦 Я получатель груза")
-async def choose_client(message: Message, state: FSMContext):
+@router.message(F.text.in_(V("btn_role_client")))
+async def choose_client(message: Message, state: FSMContext, lang: str = "ru"):
     await state.set_state(RoleStates.client_phone)
-    await message.answer(
-        "Чтобы показать ваши грузы, поделитесь номером телефона — "
-        "найдём вас в базе по номеру, который вы оставляли брокеру.",
-        reply_markup=keyboards.phone_keyboard(),
-    )
+    await message.answer(t(lang, "client_phone_ask"), reply_markup=keyboards.phone_keyboard(lang))
 
 
-@router.message(F.text == "🌍 Я отправитель / брокер")
-async def choose_broker(message: Message, state: FSMContext):
+@router.message(F.text.in_(V("btn_role_broker")))
+async def choose_broker(message: Message, state: FSMContext, lang: str = "ru"):
     await state.set_state(RoleStates.broker_phone)
-    await message.answer("Поделитесь номером телефона для связи.", reply_markup=keyboards.phone_keyboard())
+    await message.answer(t(lang, "broker_phone_ask"), reply_markup=keyboards.phone_keyboard(lang))
 
 
-async def _cancel(message: Message, state: FSMContext) -> bool:
-    if message.text == "❌ Отмена":
+async def _cancel(message: Message, state: FSMContext, lang: str) -> bool:
+    if message.text in V("btn_cancel"):
         await state.clear()
-        await message.answer("Отменено. /start — начать заново.", reply_markup=keyboards.remove_keyboard())
+        await message.answer(t(lang, "cancelled"), reply_markup=keyboards.remove_keyboard())
         return True
     return False
 
@@ -293,13 +314,13 @@ def _own_contact(message: Message) -> Optional[str]:
 # ==================== КЛИЕНТ ====================
 
 @router.message(RoleStates.client_phone)
-async def client_phone(message: Message, state: FSMContext):
-    if await _cancel(message, state):
+async def client_phone(message: Message, state: FSMContext, lang: str = "ru"):
+    if await _cancel(message, state, lang):
         return
     phone = _own_contact(message)
     if not phone:
-        await message.answer("Нажмите кнопку «📱 Поделиться номером» — нужен ваш собственный номер.",
-                             reply_markup=keyboards.phone_keyboard())
+        await message.answer(t(lang, "need_own_phone", btn=t(lang, "btn_share_phone")),
+                             reply_markup=keyboards.phone_keyboard(lang))
         return
     try:
         found = await bitrix_client.find_client_by_phone(phone)
@@ -320,29 +341,27 @@ async def client_phone(message: Message, state: FSMContext):
         await state.clear()
         await notify_admins("people", f"👤 Новый клиент: <b>{escape(u.full_name)}</b> "
                                       f"({escape(found.get('company_title') or 'без компании')}), найден по телефону",
-                            InlineKeyboardMarkup(inline_keyboard=[[
-                                InlineKeyboardButton(text="👤 Карточка", callback_data=f"adm:p:{pid}")]]))
+                            _card_kb(pid))
         await message.answer(
-            f"✅ Нашли вас: <b>{escape(found.get('company_title') or found.get('contact_name') or '')}</b>.\n"
-            f"Рейсов сейчас: {len(trips)}. Новые рейсы по вашим заказам появятся автоматически.",
-            reply_markup=keyboards.client_menu(), parse_mode="HTML",
+            t(lang, "client_found", name=escape(found.get("company_title") or found.get("contact_name") or ""),
+              n=len(trips)),
+            reply_markup=keyboards.client_menu(lang), parse_mode="HTML",
         )
         if trips:
-            await send_trip_list(message, u.id)
+            await send_trip_list(message, u.id, lang)
         return
     await state.update_data(phone=phone)
     await state.set_state(RoleStates.client_inn)
-    await message.answer("Не нашли этот номер в нашей базе. Введите ИНН вашей компании (10 или 12 цифр).",
-                         reply_markup=keyboards.cancel_keyboard())
+    await message.answer(t(lang, "client_inn_ask"), reply_markup=keyboards.cancel_keyboard(lang))
 
 
 @router.message(RoleStates.client_inn)
-async def client_inn(message: Message, state: FSMContext):
-    if await _cancel(message, state):
+async def client_inn(message: Message, state: FSMContext, lang: str = "ru"):
+    if await _cancel(message, state, lang):
         return
     inn = "".join(ch for ch in (message.text or "") if ch.isdigit())
     if len(inn) not in (10, 12):
-        await message.answer("ИНН — 10 или 12 цифр. Попробуйте ещё раз или нажмите «❌ Отмена».")
+        await message.answer(t(lang, "inn_bad", btn=t(lang, "btn_cancel")))
         return
     data = await state.get_data()
     try:
@@ -374,32 +393,31 @@ async def client_inn(message: Message, state: FSMContext):
             InlineKeyboardButton(text="✉️ Написать", callback_data=f"adm:pm:{pid}"),
         ]])
     await notify_admins("people", text, kb)
-    await message.answer("⏳ Заявка отправлена диспетчеру. Мы сообщим, когда доступ откроется.",
-                         reply_markup=keyboards.remove_keyboard())
+    await message.answer(t(lang, "request_sent"), reply_markup=keyboards.remove_keyboard())
 
 
 # ==================== БРОКЕР ====================
 
 @router.message(RoleStates.broker_phone)
-async def broker_phone(message: Message, state: FSMContext):
-    if await _cancel(message, state):
+async def broker_phone(message: Message, state: FSMContext, lang: str = "ru"):
+    if await _cancel(message, state, lang):
         return
     phone = _own_contact(message)
     if not phone:
-        await message.answer("Нажмите кнопку «📱 Поделиться номером».", reply_markup=keyboards.phone_keyboard())
+        await message.answer(t(lang, "need_own_phone", btn=t(lang, "btn_share_phone")),
+                             reply_markup=keyboards.phone_keyboard(lang))
         return
     await state.update_data(phone=phone)
     await state.set_state(RoleStates.broker_company)
-    await message.answer("Напишите название вашей компании и страну (например: «Sugd Logistics, Таджикистан»).",
-                         reply_markup=keyboards.cancel_keyboard())
+    await message.answer(t(lang, "broker_company_ask"), reply_markup=keyboards.cancel_keyboard(lang))
 
 
 @router.message(RoleStates.broker_company)
-async def broker_company(message: Message, state: FSMContext):
-    if await _cancel(message, state):
+async def broker_company(message: Message, state: FSMContext, lang: str = "ru"):
+    if await _cancel(message, state, lang):
         return
     if not message.text or len(message.text.strip()) < 2:
-        await message.answer("Напишите название компании текстом.")
+        await message.answer(t(lang, "company_text_needed"))
         return
     data = await state.get_data()
     u = message.from_user
@@ -414,37 +432,35 @@ async def broker_company(message: Message, state: FSMContext):
         "people",
         f"🙋 <b>Брокер / отправитель просит доступ</b>: {escape(u.full_name)}"
         + (f" @{escape(u.username)}" if u.username else "")
-        + f"\n📞 {escape(data.get('phone') or '—')}\n🏢 {escape(message.text.strip())}",
+        + f"\n📞 {escape(data.get('phone') or '—')}\n🏢 {escape(message.text.strip())}"
+        + f"\n🌐 Язык: {i18n.LANG_NAMES[lang]}",
         admin_pp_kb(pid),
     )
-    await message.answer("⏳ Заявка отправлена диспетчеру. Мы сообщим, когда доступ откроется.",
-                         reply_markup=keyboards.remove_keyboard())
+    await message.answer(t(lang, "request_sent"), reply_markup=keyboards.remove_keyboard())
 
 
 # ==================== МОИ РЕЙСЫ ====================
 
-def _trip_line(t, loc) -> str:
-    mark = "🟢" if t.status == "active" else "⚪"
-    seen = ago(loc.recorded_at) if loc else "нет точек"
-    return f"{mark} {t.truck_number} → {terminal_name(t.terminal_code).split(' — ')[0]} · {seen}"[:60]
+def _trip_line(lang, trip, loc) -> str:
+    mark = "🟢" if trip.status == "active" else "⚪"
+    seen = i18n.ago(lang, loc.recorded_at) if loc else t(lang, "no_points_short")
+    return f"{mark} {trip.truck_number} → {i18n.terminal_short(lang, trip.terminal_code)} · {seen}"[:60]
 
 
-async def send_trip_list(message: Message, user_id: int):
+async def send_trip_list(message: Message, user_id: int, lang: str = "ru"):
     async with get_session() as session:
         trips = await access.trips_for_user(session, user_id)
-        rows = [(t, await crud.get_last_trip_location(session, t)) for t in trips]
+        rows = [(tr, await crud.get_last_trip_location(session, tr)) for tr in trips]
     if not rows:
-        await message.answer("Рейсов пока нет. Когда по вашему заказу поедет машина, она появится здесь.")
+        await message.answer(t(lang, "no_trips"))
         return
-    kb = [[InlineKeyboardButton(text=_trip_line(t, loc), callback_data=f"v:t:{t.id}")] for t, loc in rows]
-    await message.answer(
-        f"📦 <b>Рейсы</b> ({len(rows)}): 🟢 в пути, ⚪ завершён за последние 30 дней",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML",
-    )
+    kb = [[InlineKeyboardButton(text=_trip_line(lang, tr, loc), callback_data=f"v:t:{tr.id}")] for tr, loc in rows]
+    await message.answer(t(lang, "trips_header", n=len(rows)),
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
 
 
-@router.message(F.text.in_({"📦 Мои рейсы", "📦 Все рейсы"}))
-async def my_trips(message: Message, state: FSMContext):
+@router.message(F.text.in_(V("btn_my_trips") | {"📦 Все рейсы"}))
+async def my_trips(message: Message, state: FSMContext, lang: str = "ru"):
     uid = message.from_user.id
     if not access.is_admin(uid):
         async with get_session() as session:
@@ -452,73 +468,72 @@ async def my_trips(message: Message, state: FSMContext):
         if not p or p.status != "active":
             raise SkipHandler()
     await state.clear()
-    await send_trip_list(message, uid)
+    await send_trip_list(message, uid, lang)
 
 
-async def viewer_card(session, trip, user_id: int):
+async def viewer_card(session, trip, lang: str = "ru"):
     loc = await crud.get_last_trip_location(session, trip)
-    t = TERMINALS.get(str(trip.terminal_code or ""), {})
-    status = {"active": "🟢 в пути", "completed": "⚪ завершён", "cancelled": "отменён"}.get(trip.status, trip.status)
-    lines = [
-        f"🚛 <b>{escape(trip.truck_number)}</b> — {status}",
-    ]
+    status = {"active": t(lang, "st_active"), "completed": t(lang, "st_done"),
+              "cancelled": t(lang, "st_cancelled")}.get(trip.status, trip.status)
+    lines = [f"🚛 <b>{escape(trip.truck_number)}</b> — {status}"]
     if trip.bitrix_deal_title:
         lines.append(f"📋 {escape(trip.bitrix_deal_title)}")
-    lines.append(f"🏭 {escape(terminal_name(trip.terminal_code))}")
-    if t.get("address_ru"):
-        lines.append(f"     {escape(t['address_ru'])}")
+    lines.append(f"🏭 {escape(i18n.terminal_name(lang, trip.terminal_code))}")
+    addr = i18n.terminal_address(lang, trip.terminal_code)
+    if addr:
+        lines.append(f"     {escape(addr)}")
     if trip.shipment_date:
-        lines.append(f"📦 Отгрузка: {msk(trip.shipment_date, '%d.%m.%Y')}")
+        lines.append(t(lang, "card_shipment", d=msk(trip.shipment_date, "%d.%m.%Y")))
     if trip.planned_arrival_date:
-        lines.append(f"📅 План прибытия: {msk(trip.planned_arrival_date, '%d.%m.%Y')}")
+        lines.append(t(lang, "card_planned", d=msk(trip.planned_arrival_date, "%d.%m.%Y")))
     if not trip.driver_id:
-        lines.append("👤 Водитель ещё не подключился")
+        lines.append(t(lang, "card_no_driver"))
     if loc:
-        dist = f"\n📏 До терминала: {loc.distance_to_destination_km:.0f} км" if loc.distance_to_destination_km else ""
-        lines.append(f"📍 <b>Сейчас:</b> {escape(loc.address or '')}\n🕐 {msk(loc.recorded_at)} МСК "
-                     f"({ago(loc.recorded_at)}){dist}")
+        dist = t(lang, "card_dist", km=f"{loc.distance_to_destination_km:.0f}") if loc.distance_to_destination_km else ""
+        lines.append(t(lang, "card_now", addr=escape(loc.address or ""),
+                       time=f"{msk(loc.recorded_at)} {t(lang, 'msk')}", ago=i18n.ago(lang, loc.recorded_at)) + dist)
         lines.append(f"🌐 {loc.latitude:.5f}, {loc.longitude:.5f}")
     else:
-        lines.append("📍 Местоположение ещё не передавалось")
+        lines.append(t(lang, "card_no_location"))
     if trip.arrived_notified_at:
-        lines.append(f"🏁 У терминала с {msk(trip.arrived_notified_at)}")
+        lines.append(t(lang, "card_at_terminal", t=msk(trip.arrived_notified_at)))
 
     kb = []
     if loc:
-        kb.append([InlineKeyboardButton(text="📍 Где сейчас", callback_data=f"v:loc:{trip.id}"),
-                   InlineKeyboardButton(text="📜 История", callback_data=f"v:h:{trip.id}")])
+        kb.append([InlineKeyboardButton(text=t(lang, "btn_where"), callback_data=f"v:loc:{trip.id}"),
+                   InlineKeyboardButton(text=t(lang, "btn_history"), callback_data=f"v:h:{trip.id}")])
         url = access.track_url(trip.id)
         if url:
-            kb.append([InlineKeyboardButton(text="🗺 Маршрут на карте", url=url)])
-    kb.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"v:t:{trip.id}"),
-               InlineKeyboardButton(text="◀️ Все рейсы", callback_data="v:list")])
+            kb.append([InlineKeyboardButton(text=t(lang, "btn_map"), url=url)])
+    kb.append([InlineKeyboardButton(text=t(lang, "btn_refresh"), callback_data=f"v:t:{trip.id}"),
+               InlineKeyboardButton(text=t(lang, "btn_all_trips"), callback_data="v:list")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-async def _load_viewable(cb: CallbackQuery, trip_id: int):
+async def _load_viewable(cb: CallbackQuery, trip_id: int, lang: str):
     async with get_session() as session:
         trip = await crud.get_trip_by_id(session, trip_id)
         ok = await access.can_view(session, cb.from_user.id, trip)
     if not ok:
-        await cb.answer("Нет доступа к этому рейсу", show_alert=True)
+        await cb.answer(t(lang, "no_access_trip"), show_alert=True)
         return None
     return trip
 
 
 @router.callback_query(F.data == "v:list")
-async def cb_list(cb: CallbackQuery):
-    await send_trip_list(cb.message, cb.from_user.id)
+async def cb_list(cb: CallbackQuery, lang: str = "ru"):
+    await send_trip_list(cb.message, cb.from_user.id, lang)
     await cb.answer()
 
 
 @router.callback_query(F.data.startswith("v:t:"))
-async def cb_card(cb: CallbackQuery):
+async def cb_card(cb: CallbackQuery, lang: str = "ru"):
     trip_id = int(cb.data.split(":")[2])
-    if not await _load_viewable(cb, trip_id):
+    if not await _load_viewable(cb, trip_id, lang):
         return
     async with get_session() as session:
         trip = await crud.get_trip_by_id(session, trip_id)
-        text, kb = await viewer_card(session, trip, cb.from_user.id)
+        text, kb = await viewer_card(session, trip, lang)
     try:
         await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     except Exception:
@@ -527,74 +542,72 @@ async def cb_card(cb: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("v:loc:"))
-async def cb_where(cb: CallbackQuery):
-    trip_id = int(cb.data.split(":")[2])
-    trip = await _load_viewable(cb, trip_id)
+async def cb_where(cb: CallbackQuery, lang: str = "ru"):
+    trip = await _load_viewable(cb, int(cb.data.split(":")[2]), lang)
     if not trip:
         return
     async with get_session() as session:
         loc = await crud.get_last_trip_location(session, trip)
     if not loc:
-        await cb.answer("Точек ещё нет", show_alert=True)
+        await cb.answer(t(lang, "no_points"), show_alert=True)
         return
     await cb.message.answer_location(latitude=loc.latitude, longitude=loc.longitude)
-    await cb.answer(f"Точка {ago(loc.recorded_at)}")
+    await cb.answer(t(lang, "point_ago", ago=i18n.ago(lang, loc.recorded_at)))
 
 
 @router.callback_query(F.data.startswith("v:h:"))
-async def cb_history(cb: CallbackQuery):
-    trip_id = int(cb.data.split(":")[2])
-    trip = await _load_viewable(cb, trip_id)
+async def cb_history(cb: CallbackQuery, lang: str = "ru"):
+    trip = await _load_viewable(cb, int(cb.data.split(":")[2]), lang)
     if not trip:
         return
     async with get_session() as session:
         points = await crud.get_trip_points(session, trip)
     if not points:
-        await cb.answer("Точек ещё нет", show_alert=True)
+        await cb.answer(t(lang, "no_points"), show_alert=True)
         return
     last = points[-15:]
-    lines = [f"📜 <b>История {escape(trip.truck_number)}</b> — точек всего {len(points)}, последние {len(last)}:\n"]
+    lines = [t(lang, "history_header", truck=escape(trip.truck_number), n=len(points), k=len(last))]
     for p in reversed(last):
         addr = ", ".join((p.address or "").split(", ")[:3])
-        dist = f" · {p.distance_to_destination_km:.0f} км до терминала" if p.distance_to_destination_km else ""
+        dist = t(lang, "history_dist", km=f"{p.distance_to_destination_km:.0f}") if p.distance_to_destination_km else ""
         lines.append(f"🕐 {msk(p.recorded_at)} — {escape(addr)}{dist}")
     url = access.track_url(trip.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🗺 Маршрут на карте", url=url)]]) if url else None
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t(lang, "btn_map"), url=url)]]) if url else None
     await cb.message.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     await cb.answer()
 
 
 # ==================== НОВЫЙ РЕЙС (брокер / админ) ====================
 
-@router.message(F.text == "➕ Новый рейс", CanCreateTrip())
-async def new_trip_start(message: Message, state: FSMContext):
+@router.message(F.text.in_(V("btn_create_trip")), CanCreateTrip())
+async def new_trip_start(message: Message, state: FSMContext, lang: str = "ru"):
     await state.set_state(RoleStates.new_trip_truck)
-    await message.answer("Введите номер тягача (или контейнера), без пробелов:", reply_markup=keyboards.cancel_keyboard())
+    await message.answer(t(lang, "new_trip_truck_ask"), reply_markup=keyboards.cancel_keyboard(lang))
 
 
 @router.message(RoleStates.new_trip_truck)
-async def new_trip_truck(message: Message, state: FSMContext):
-    if await _cancel(message, state):
+async def new_trip_truck(message: Message, state: FSMContext, lang: str = "ru"):
+    if await _cancel(message, state, lang):
         return
     from src.bot.handlers import validate_plate_number
     truck = (message.text or "").strip().upper().replace(" ", "").replace("-", "")
     if not validate_plate_number(truck):
-        await message.answer("Неверный формат номера. Пример: 01A123BC, А123ВС77, TPPU4000202")
+        await message.answer(t(lang, "bad_plate"))
         return
     await state.update_data(truck=truck)
     await state.set_state(RoleStates.new_trip_inn)
-    await message.answer("ИНН получателя в России (10 или 12 цифр) — или «Пропустить»:",
-                         reply_markup=keyboards.skip_keyboard())
+    await message.answer(t(lang, "new_trip_inn_ask", btn=t(lang, "btn_skip")), reply_markup=keyboards.skip_keyboard(lang))
 
 
 @router.message(RoleStates.new_trip_inn)
-async def new_trip_inn(message: Message, state: FSMContext):
-    if await _cancel(message, state):
+async def new_trip_inn(message: Message, state: FSMContext, lang: str = "ru"):
+    if await _cancel(message, state, lang):
         return
     text = (message.text or "").strip()
     inn = "".join(ch for ch in text if ch.isdigit())
-    if text != "Пропустить" and len(inn) not in (10, 12):
-        await message.answer("ИНН — 10 или 12 цифр, или нажмите «Пропустить».")
+    skip = text in V("btn_skip")
+    if not skip and len(inn) not in (10, 12):
+        await message.answer(t(lang, "inn_or_skip", btn=t(lang, "btn_skip")))
         return
     data = await state.get_data()
     truck = data["truck"]
@@ -606,7 +619,7 @@ async def new_trip_inn(message: Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Bitrix search failed: {e}")
     company = None
-    if inn and not deal:
+    if inn and not skip and not deal:
         try:
             company = await bitrix_client.find_company_by_inn(inn)
         except Exception as e:
@@ -614,30 +627,29 @@ async def new_trip_inn(message: Message, state: FSMContext):
 
     async with get_session() as session:
         p = await access.get_participant(session, u.id)
-        trip = await crud.create_trip(
-            session, driver_id=None, truck_number=truck,
-            created_by_participant_id=p.id if p else None,
-        )
+        trip = await crud.create_trip(session, driver_id=None, truck_number=truck,
+                                      created_by_participant_id=p.id if p else None)
         if deal:
             apply_deal_to_trip(trip, deal)
+            who = "брокер" if p and p.role == "broker" else "диспетчер"
+            await announce_link(session, trip, None, f"{who} {u.full_name} создал рейс в боте, водитель подключится по ссылке")
         elif company:
             trip.bitrix_company_id = company["company_id"]
         inv = await access.create_invite(session, "driver", u.id, trip_id=trip.id, days=30)
-        trip_id, deal_id, deal_title = trip.id, trip.bitrix_deal_id, trip.bitrix_deal_title
-        tname = terminal_name(trip.terminal_code)
+        trip_id, deal_id, deal_title, terminal_code = trip.id, trip.bitrix_deal_id, trip.bitrix_deal_title, trip.terminal_code
     await state.clear()
 
     link = access.invite_link(await bot_username(message.bot), "drv", inv.code)
     role = "admin" if access.is_admin(u.id) else "broker"
-    lines = [f"✅ <b>Рейс {escape(truck)} создан</b>"]
+    lines = [t(lang, "trip_created", truck=escape(truck))]
     if deal_id:
-        lines.append(f"📋 Найдена сделка: {escape(deal_title or '')}\n🏭 {escape(tname)}")
+        lines.append(t(lang, "tc_deal_found", title=escape(deal_title or ""),
+                       terminal=escape(i18n.terminal_name(lang, terminal_code))))
     else:
-        lines.append("Сделка с этим номером пока не найдена — диспетчер привяжет её.")
-    lines.append(f"\n👉 <b>Перешлите водителю ссылку:</b>\n{link}\n\n"
-                 f"Водитель откроет её, даст согласие — и сразу окажется в этом рейсе, номер вводить не нужно.")
+        lines.append(t(lang, "tc_deal_not_found"))
+    lines.append(t(lang, "tc_driver_link", link=link))
     await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True,
-                         reply_markup=menu_for(role))
+                         reply_markup=menu_for(role, lang))
     if role == "broker":
         await notify_admins(
             "reg", f"➕ <b>Брокер {escape(u.full_name)} создал рейс</b> {escape(truck)}"
@@ -649,28 +661,28 @@ async def new_trip_inn(message: Message, state: FSMContext):
 
 # ==================== НАПИСАТЬ ДИСПЕТЧЕРУ ====================
 
-@router.message(F.text == "✉️ Написать диспетчеру", ActiveParticipant("client", "broker"))
-async def write_dispatcher(message: Message, state: FSMContext):
+@router.message(F.text.in_(V("btn_write_dispatcher")), ActiveParticipant("client", "broker"))
+async def write_dispatcher(message: Message, state: FSMContext, lang: str = "ru"):
     await state.set_state(RoleStates.write_dispatcher)
-    await message.answer("Напишите сообщение — передам диспетчеру.", reply_markup=keyboards.cancel_keyboard())
+    await message.answer(t(lang, "write_dispatcher_ask"), reply_markup=keyboards.cancel_keyboard(lang))
 
 
 @router.message(RoleStates.write_dispatcher)
-async def write_dispatcher_text(message: Message, state: FSMContext):
-    if await _cancel(message, state):
+async def write_dispatcher_text(message: Message, state: FSMContext, lang: str = "ru"):
+    if await _cancel(message, state, lang):
         return
     if not message.text:
-        await message.answer("Пока можно отправить только текст.")
+        await message.answer(t(lang, "only_text"))
         return
-    await _forward_participant_text(message, state)
+    await _forward_participant_text(message, state, lang)
 
 
 @router.message(F.text & ~F.text.startswith("/"), ActiveParticipant("client", "broker"))
-async def participant_free_text(message: Message, state: FSMContext):
-    await _forward_participant_text(message, state)
+async def participant_free_text(message: Message, state: FSMContext, lang: str = "ru"):
+    await _forward_participant_text(message, state, lang)
 
 
-async def _forward_participant_text(message: Message, state: FSMContext):
+async def _forward_participant_text(message: Message, state: FSMContext, lang: str):
     async with get_session() as session:
         p = await access.get_participant(session, message.from_user.id)
     await state.clear()
@@ -683,4 +695,4 @@ async def _forward_participant_text(message: Message, state: FSMContext):
             InlineKeyboardButton(text="👤 Карточка", callback_data=f"adm:p:{p.id}"),
         ]]),
     )
-    await message.answer("✉️ Сообщение передано диспетчеру.", reply_markup=menu_for(p.role))
+    await message.answer(t(lang, "sent_to_dispatcher"), reply_markup=menu_for(p.role, lang))

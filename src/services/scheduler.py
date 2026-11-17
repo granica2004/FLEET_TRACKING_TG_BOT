@@ -57,11 +57,12 @@ async def daily_location_request():
                 
                 if trip:
                     # Есть активный рейс — запрашиваем локацию
+                    from src import i18n
+                    lang = await i18n.get_lang(driver.telegram_id)
                     await _bot.send_message(
                         driver.telegram_id,
-                        "🌅 Доброе утро!\n\n"
-                        "Пожалуйста, отправьте ваше текущее местоположение для обновления статуса перевозки.",
-                        reply_markup=_keyboards.location_keyboard()
+                        i18n.t(lang, "morning_request"),
+                        reply_markup=_keyboards.location_keyboard(lang)
                     )
                     logger.info(f"Sent location request to driver {driver.telegram_id}")
                 else:
@@ -125,12 +126,14 @@ async def check_last_call_triggers():
             
             should_trigger = False
             trigger_reason = ""
+            reason_km = reason_days = None
             
             # Триггер по дням в пути
             if trip.days_in_transit and trip.days_in_transit >= settings.last_call_days_in_transit:
                 if not trip.planned_arrival_date:
                     should_trigger = True
                     trigger_reason = f"в пути уже {trip.days_in_transit} дней"
+                    reason_days = trip.days_in_transit
             
             # Триггер по расстоянию (если есть последняя локация)
             if not should_trigger and trip.terminal_code:
@@ -144,18 +147,20 @@ async def check_last_call_triggers():
                     if route_info and route_info["distance_km"] < settings.last_call_distance_km:
                         should_trigger = True
                         trigger_reason = f"до терминала менее {settings.last_call_distance_km} км"
+                        reason_km = settings.last_call_distance_km
             
             if should_trigger:
                 try:
                     # Получаем водителя
                     driver = await crud.get_driver_by_id(session, trip.driver_id) if trip.driver_id else None
                     if driver:
+                        from src import i18n
+                        lang = await i18n.get_lang(driver.telegram_id)
+                        text = (i18n.t(lang, "lastcall_km", km=reason_km) if reason_km is not None
+                                else i18n.t(lang, "lastcall_days", days=reason_days))
                         await _bot.send_message(
-                            driver.telegram_id,
-                            f"🏁 Внимание!\n\n"
-                            f"Груз {trigger_reason}.\n\n"
-                            f"Пожалуйста, укажите планируемую дату прибытия на терминал:",
-                            reply_markup=_keyboards.arrival_date_keyboard()
+                            driver.telegram_id, text,
+                            reply_markup=_keyboards.arrival_date_keyboard(lang)
                         )
                         
                         trip.last_call_triggered = True
@@ -164,7 +169,7 @@ async def check_last_call_triggers():
                         logger.info(f"Last call triggered for trip {trip.id}: {trigger_reason}")
                         
                         from src.services import events
-                        await events.on_last_call(session, trip, trigger_reason)
+                        await events.on_last_call(session, trip, km=reason_km, days=reason_days)
                         from src.services.notify import notify_admins
                         from src.services.trips import deal_link
                         from src.bot.admin import trip_button

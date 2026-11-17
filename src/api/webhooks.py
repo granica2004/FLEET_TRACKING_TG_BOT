@@ -13,6 +13,8 @@ from html import escape
 
 from src.config import get_settings, TERMINALS, terminal_name
 from src.services.notify import notify_admins
+from src.services.deal_sync import announce_link
+from src import i18n
 from src.services.trips import apply_deal_to_trip, deal_link
 from src.db.database import get_session
 from src.db import crud
@@ -144,11 +146,10 @@ async def bitrix_deal_update_webhook(request: Request):
                 driver = await crud.get_driver_by_id(session, trip.driver_id) if trip.driver_id else None
                 if driver and _bot:
                     try:
+                        lang = await i18n.get_lang(driver.telegram_id)
                         await _bot.send_message(
                             driver.telegram_id,
-                            "✅ <b>Перевозка завершена!</b>\n\n"
-                            "Груз прибыл на терминал. Отслеживание остановлено.\n\n"
-                            "Спасибо за работу! Для новой перевозки нажмите /start",
+                            i18n.t(lang, "done_by_stage"),
                             reply_markup=keyboards.remove_keyboard(),
                             parse_mode="HTML"
                         )
@@ -196,19 +197,18 @@ async def bitrix_deal_update_webhook(request: Request):
                     apply_deal_to_trip(waiting_trip, deal)
                     await events.on_trip_started(session, waiting_trip)
                     await bitrix_client.update_driver_telegram_id(deal_id, registration.telegram_id)
-                    await bitrix_client.add_timeline_comment(
-                        deal_id, f"🚛 Водитель {truck_number} привязан к сделке Telegram-ботом отслеживания."
-                    )
+                    await announce_link(session, waiting_trip, driver,
+                                        "сделка появилась после регистрации водителя, найдена по номеру")
                     tname = terminal_name(waiting_trip.terminal_code)
                     if _bot:
                         try:
+                            lang = await i18n.get_lang(registration.telegram_id)
                             await _bot.send_message(
                                 registration.telegram_id,
-                                f"🎉 <b>Сделка найдена!</b>\n\n"
-                                f"📋 {escape(deal.get('TITLE') or 'Без названия')}\n"
-                                f"🏭 Терминал: {escape(tname)}\n\n"
-                                f"Теперь ваше местоположение будет передаваться брокеру.",
-                                reply_markup=keyboards.location_keyboard(),
+                                i18n.t(lang, "deal_matched",
+                                       title=escape(deal.get('TITLE') or i18n.t(lang, "unnamed")),
+                                       terminal=escape(i18n.terminal_name(lang, waiting_trip.terminal_code))),
+                                reply_markup=keyboards.location_keyboard(lang),
                                 parse_mode="HTML"
                             )
                         except Exception as e:
@@ -228,13 +228,13 @@ async def bitrix_deal_update_webhook(request: Request):
                     active = await crud.get_active_trip_by_driver(session, driver.id)
                     if not active and _bot:
                         try:
+                            lang = await i18n.get_lang(driver.telegram_id)
                             await _bot.send_message(
                                 driver.telegram_id,
-                                f"🚛 <b>Обнаружена новая перевозка!</b>\n\n"
-                                f"📋 {escape(deal.get('TITLE') or 'Без названия')}\n"
-                                f"🏭 Терминал: {escape(terminal_name(deal.get(settings.bitrix_field_terminal)))}\n\n"
-                                f"Начать отслеживание?",
-                                reply_markup=keyboards.start_trip_keyboard(deal_id),
+                                i18n.t(lang, "new_trip_offer",
+                                       title=escape(deal.get('TITLE') or i18n.t(lang, "unnamed")),
+                                       terminal=escape(i18n.terminal_name(lang, deal.get(settings.bitrix_field_terminal)))),
+                                reply_markup=keyboards.start_trip_keyboard(deal_id, lang),
                                 parse_mode="HTML"
                             )
                             logger.info(f"Sent trip offer to driver {driver.telegram_id}")

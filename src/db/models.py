@@ -267,3 +267,13 @@ class Invite(Base):
     used_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class UserPref(Base):
+    """Настройки пользователя Telegram (язык интерфейса)"""
+
+    __tablename__ = "user_prefs"
+
+    telegram_id = Column(BigInteger, primary_key=True)
+    lang = Column(String(5), nullable=False, default="ru")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

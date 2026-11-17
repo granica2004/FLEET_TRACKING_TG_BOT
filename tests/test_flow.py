@@ -126,6 +126,9 @@ async def app(env):
     session = FakeSession()
     bot = Bot(token="123456:TESTTOKEN", session=session)
     dp = Dispatcher(storage=MemoryStorage())
+    from src.bot.lang_mw import LangMiddleware
+    dp.message.middleware(LangMiddleware())
+    dp.callback_query.middleware(LangMiddleware())
     dp.include_router(admin_router)
     dp.include_router(roles_router)
     dp.include_router(bot_router)
@@ -150,7 +153,7 @@ async def app(env):
         bx["updates"].append((deal_id, tg))
         return True
 
-    async def add_loc(deal_id, address, lat, lon, distance_km=None, eta=None):
+    async def add_loc(deal_id, address, lat, lon, distance_km=None, eta=None, recorded_at=None):
         bx["comments"].append((deal_id, f"loc {address}"))
         return True
 
@@ -251,6 +254,8 @@ def joined(lst):
 async def test_driver_registers_with_deal(app):
     s = app["s"]
     await text(app, DRIVER1, "/start")
+    assert "Tilni tanlang" in joined(s.sent_to(DRIVER1))
+    await press(app, DRIVER1, "lang:ru")
     assert "Кто вы?" in joined(s.sent_to(DRIVER1))
     await text(app, DRIVER1, "🚛 Я водитель")
     assert "отправитель груза и получатель груза" in joined(s.sent_to(DRIVER1))
@@ -319,6 +324,7 @@ async def test_non_admin_has_no_access(app):
 async def test_unlinked_driver_manual_bind(app):
     s = app["s"]
     await text(app, DRIVER2, "/start")
+    await press(app, DRIVER2, "lang:ru")
     await text(app, DRIVER2, "🚛 Я водитель")
     await text(app, DRIVER2, "✅ Даю согласие на передачу геолокации")
     s.clear()
@@ -330,6 +336,7 @@ async def test_unlinked_driver_manual_bind(app):
     async with get_session() as session:
         d2 = await crud.get_driver_by_telegram_id(session, DRIVER2)
         trip = await crud.get_active_trip_by_driver(session, d2.id)
+    await location(app, DRIVER2, 54.9, 82.8)  # точка до привязки к сделке
     s.clear()
     await press(app, ADMIN, "adm:trips:u:0")
     assert "777XYZ" in str(s.calls[0])  # кнопка рейса в списке без сделки
@@ -342,6 +349,9 @@ async def test_unlinked_driver_manual_bind(app):
     async with get_session() as session:
         trip = await crud.get_trip_by_id(session, trip.id)
         assert trip.bitrix_deal_id == 555 and trip.terminal_code == "302"
+    comments = [c for d, c in app["bx"]["comments"] if d == 555]
+    assert any("привязан к сделке" in c and "вручную" in c for c in comments)
+    assert any(c.startswith("loc ") for c in comments)  # точка, присланная до привязки, ушла в сделку
 
 
 async def test_driver_message_and_admin_reply(app):
@@ -441,6 +451,7 @@ async def test_client_by_phone_sees_trip(app):
     s = app["s"]
     s.clear()
     await text(app, CLIENT, "/start")
+    await press(app, CLIENT, "lang:ru")
     await text(app, CLIENT, "📦 Я получатель груза")
     await contact(app, CLIENT, "+7 926 360-23-26")
     out = joined(s.sent_to(CLIENT))
@@ -495,6 +506,7 @@ async def test_border_and_arrival_events(app):
 async def test_client_by_inn_needs_approval(app):
     s = app["s"]
     await text(app, CLIENT2, "/start")
+    await press(app, CLIENT2, "lang:ru")
     await text(app, CLIENT2, "📦 Я получатель груза")
     await contact(app, CLIENT2, "+70000000000")
     assert "ИНН" in joined(s.sent_to(CLIENT2))
@@ -559,6 +571,7 @@ async def test_admin_trip_driver_joins_by_number(app):
     await text(app, ADMIN, "Пропустить")
     assert "start=drv_" in joined(s.sent_to(ADMIN))
     await text(app, DRIVER4, "/start")
+    await press(app, DRIVER4, "lang:ru")
     await text(app, DRIVER4, "🚛 Я водитель")
     await text(app, DRIVER4, "✅ Даю согласие на передачу геолокации")
     s.clear()
@@ -570,6 +583,7 @@ async def test_admin_trip_driver_joins_by_number(app):
 async def test_broker_self_registration(app):
     s = app["s"]
     await text(app, BROKER2, "/start")
+    await press(app, BROKER2, "lang:ru")
     await text(app, BROKER2, "🌍 Я отправитель / брокер")
     await contact(app, BROKER2, "+992900000000")
     s.clear()
@@ -627,6 +641,66 @@ async def test_people_screens(app):
     assert "Кто видит рейс" in out and "СОГДИАНА" in out
 
 
+# ==================== ЯЗЫКИ И БИТРИКС ====================
+
+UZ_DRIVER = 6001
+EN_CLIENT = 6002
+
+
+async def test_uzbek_driver_flow(app):
+    s = app["s"]
+    await text(app, UZ_DRIVER, "/start")
+    await press(app, UZ_DRIVER, "lang:uz")
+    assert "Siz kimsiz?" in joined(s.sent_to(UZ_DRIVER))
+    await text(app, UZ_DRIVER, "🚛 Men haydovchiman")
+    assert "roziligingiz kerak" in joined(s.sent_to(UZ_DRIVER))
+    s.clear()
+    await text(app, UZ_DRIVER, "✅ Joylashuvni yuborishga roziman")
+    assert "tyagach raqamini" in joined(s.sent_to(UZ_DRIVER))
+    s.clear()
+    await text(app, UZ_DRIVER, "11UZ111")
+    assert "Ro'yxatdan o'tish yakunlandi" in joined(s.sent_to(UZ_DRIVER))
+    s.clear()
+    await location(app, UZ_DRIVER)
+    assert "Joylashuv saqlandi" in joined(s.sent_to(UZ_DRIVER))
+    s.clear()
+    await text(app, UZ_DRIVER, "/help")
+    assert "Kelish terminali" in joined(s.sent_to(UZ_DRIVER))
+    await text(app, UZ_DRIVER, "/language")
+    await press(app, UZ_DRIVER, "lang:en")
+    s.clear()
+    await text(app, UZ_DRIVER, "🔄 Refresh status")
+    assert "No order for 11UZ111" in joined(s.sent_to(UZ_DRIVER))
+
+
+async def test_english_client_gets_events(app):
+    s = app["s"]
+    await text(app, EN_CLIENT, "/start")
+    await press(app, EN_CLIENT, "lang:en")
+    await text(app, EN_CLIENT, "📦 I am the consignee")
+    assert "share your phone number" in joined(s.sent_to(EN_CLIENT))
+    await contact(app, EN_CLIENT, "+7 926 360 23 26")
+    assert "We found you" in joined(s.sent_to(EN_CLIENT))
+    trip = await _trip100()
+    s.clear()
+    await press(app, EN_CLIENT, f"v:t:{trip.id}")
+    card = joined(s.sent_to(EN_CLIENT))
+    assert "on the way" in card and "Kolomna" in card and "Avtomobilistov" in card
+    s.clear()
+    app["geo"].update(country="kz", address="Kazakhstan")
+    await location(app, DRIVER1, 51.0, 52.0)
+    app["geo"].update(country="ru", address="Russia")
+    await location(app, DRIVER1, 51.5, 55.1)
+    assert "The truck has entered Russia" in joined(s.sent_to(EN_CLIENT))
+    assert "въехала в Россию" in joined(s.sent_to(CLIENT))
+
+
+def test_bitrix_text_markup():
+    from src.services.bitrix import Bitrix24Client
+    out = Bitrix24Client.to_bitrix_text("📍 <b>Местоположение</b>\n🗺️ <a href='https://x.ru/?a=1'>Карта</a>\n⏱️ 2 ч")
+    assert out == "[b]Местоположение[/b]\n[url=https://x.ru/?a=1]Карта[/url]\n⏱ 2 ч"
+
+
 async def test_bitrix_webhook_finishes_trip(app):
     s = app["s"]
     from src.main import app as fastapi_app
@@ -655,7 +729,7 @@ async def test_bitrix_webhook_matches_waiting(app):
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         r = await c.post("/webhook/bitrix24/deal-update", data={"data[FIELDS][ID]": "700"})
     assert r.json()["message"] == "Registration matched"
-    assert "Сделка найдена" in joined(s.sent_to(DRIVER1)) and "Екатеринбург" in joined(s.sent_to(DRIVER1))
+    assert "Заказ найден" in joined(s.sent_to(DRIVER1)) and "Екатеринбург" in joined(s.sent_to(DRIVER1))
     assert "Рейс привязан к сделке" in joined(s.sent_to(ADMIN))
 
 
@@ -686,3 +760,4 @@ async def test_finish_from_admin(app):
     assert "завершена диспетчером" in joined(s.sent_to(DRIVER2))
     async with get_session() as session:
         assert (await crud.get_trip_by_id(session, trip.id)).status == "completed"
+

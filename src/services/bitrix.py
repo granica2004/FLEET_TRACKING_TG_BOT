@@ -162,12 +162,28 @@ class Bitrix24Client:
             logger.error(f"Failed to update deal {deal_id}: {e}")
             return False
     
+    @staticmethod
+    def to_bitrix_text(text: str) -> str:
+        """
+        HTML → BBCode (в комментариях таймлайна работает [b], [i], [url]),
+        и без 4-байтных эмодзи: портал хранит их как коды вида :f09f938d:.
+        """
+        import re
+        text = re.sub(r"<a\s+href=['\"]([^'\"]+)['\"]\s*>(.*?)</a>", r"[url=\1]\2[/url]", text, flags=re.S)
+        for tag in ("b", "i", "u"):
+            text = re.sub(rf"<{tag}>", f"[{tag}]", text)
+            text = re.sub(rf"</{tag}>", f"[/{tag}]", text)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = "".join(ch for ch in text if ord(ch) <= 0xFFFF and ch != "\ufe0f")
+        return "\n".join(line.lstrip() for line in text.split("\n")).strip()
+    
     async def add_timeline_comment(
         self,
         deal_id: int,
         comment: str,
     ) -> bool:
         """Добавить комментарий в таймлайн сделки"""
+        comment = self.to_bitrix_text(comment)
         try:
             await self._request("crm.timeline.comment.add", {
                 "fields": {
@@ -190,8 +206,10 @@ class Bitrix24Client:
         longitude: float,
         distance_km: Optional[float] = None,
         eta: Optional[str] = None,
+        recorded_at: Optional[datetime] = None,
     ) -> bool:
-        """Добавить комментарий с геолокацией в сделку"""
+        """Добавить комментарий с геолокацией в сделку (recorded_at — время точки, UTC)"""
+        from datetime import timedelta
         
         # Формируем ссылку на карту
         map_url = f"https://yandex.ru/maps/?pt={longitude},{latitude}&z=15&l=map"
@@ -214,7 +232,7 @@ class Bitrix24Client:
             f"",
             f"🗺️ <a href='{map_url}'>Открыть на карте</a>",
             f"",
-            f"<i>Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
+            f"<i>Точка от {((recorded_at or datetime.utcnow()) + timedelta(hours=3)).strftime('%d.%m.%Y %H:%M')} МСК</i>",
         ])
         
         comment = "\n".join(lines)

@@ -24,6 +24,7 @@ from src.services.scheduler import start_scheduler, stop_scheduler, set_bot_inst
 from src.services.notify import set_notify_bot
 from src.bot.admin import router as admin_router
 from src.bot.roles import router as roles_router
+from src.bot.lang_mw import LangMiddleware
 from src.services.access import reload_admins
 from src.db.database import get_session
 
@@ -45,25 +46,32 @@ dp: Dispatcher = None
 
 
 async def setup_bot_commands(bot: Bot):
-    """Установка команд бота (меню внизу чата)"""
-    commands = [
-        BotCommand(command="start", description="🚛 Начать / Новая перевозка"),
-        BotCommand(command="help", description="❓ Справка"),
-    ]
-    
-    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
-    
-    # Админам — дополнительно /admin в меню
-    admin_commands = commands + [
+    """Меню команд: по языку Telegram пользователя (ru по умолчанию, en, uz); админам — /admin."""
+    from src.i18n import t
+
+    def cmds(lang):
+        return [
+            BotCommand(command="start", description=t(lang, "cmd_start")),
+            BotCommand(command="language", description=t(lang, "cmd_language")),
+            BotCommand(command="help", description=t(lang, "cmd_help")),
+        ]
+
+    await bot.set_my_commands(cmds("ru"), scope=BotCommandScopeDefault())
+    for lang in ("en", "uz"):
+        await bot.set_my_commands(cmds(lang), scope=BotCommandScopeDefault(), language_code=lang)
+
+    admin_commands = cmds("ru") + [
         BotCommand(command="admin", description="🛠 Админка"),
+        BotCommand(command="driver", description="🚛 Бот глазами водителя"),
         BotCommand(command="myid", description="🆔 Мой Telegram ID"),
     ]
-    for admin_id in settings.admin_ids:
+    from src.services.access import all_admin_ids
+    for admin_id in all_admin_ids():
         try:
             await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
         except Exception as e:
             logger.warning(f"Cannot set admin commands for {admin_id}: {e}")
-    logger.info(f"Bot commands set up (admins: {settings.admin_ids})")
+    logger.info(f"Bot commands set up (admins: {all_admin_ids()})")
 
 
 @asynccontextmanager
@@ -95,6 +103,8 @@ async def lifespan(app: FastAPI):
         storage = MemoryStorage()
     
     dp = Dispatcher(storage=storage)
+    dp.message.middleware(LangMiddleware())
+    dp.callback_query.middleware(LangMiddleware())
     dp.include_router(admin_router)  # раньше основного: /admin и шаги админа важнее шагов водителя
     dp.include_router(roles_router)  # клиенты, брокеры, приглашения, «Мои рейсы»
     dp.include_router(bot_router)
@@ -180,6 +190,8 @@ async def start_polling():
         storage = MemoryStorage()
     
     dp = Dispatcher(storage=storage)
+    dp.message.middleware(LangMiddleware())
+    dp.callback_query.middleware(LangMiddleware())
     dp.include_router(admin_router)  # раньше основного: /admin и шаги админа важнее шагов водителя
     dp.include_router(roles_router)  # клиенты, брокеры, приглашения, «Мои рейсы»
     dp.include_router(bot_router)
