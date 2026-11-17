@@ -666,6 +666,8 @@ async def deal_card(session, deal: dict, lang: str):
         addr = i18n.terminal_address(lang, terminal)
         if addr:
             lines.append(f"     {escape(addr)}")
+    from src.config import TERMINALS
+    cmr = TERMINALS.get(str(terminal or ""), {}).get("cmr_ru" if lang == "ru" else "cmr_en")
     truck = deal.get(settings.bitrix_field_truck_number) or deal.get(settings.bitrix_field_truck_number_alt)
     if truck:
         lines.append(t(lang, "deal_vehicle", truck=escape(str(truck))))
@@ -718,6 +720,11 @@ async def deal_card(session, deal: dict, lang: str):
         lines.append(t(lang, "deal_subject", subject=escape(subject)))
         kb.insert(0, [InlineKeyboardButton(text=t(lang, "btn_copy_subject"),
                                            copy_text=CopyTextButton(text=subject[:256]))])
+
+    # Графа 13 CMR — реквизиты СВХ терминала (если внесены в справочник)
+    if cmr:
+        lines.append(t(lang, "deal_cmr", text=escape(cmr)))
+        kb.insert(0, [InlineKeyboardButton(text=t(lang, "btn_copy_cmr"), copy_text=CopyTextButton(text=cmr[:256]))])
 
     kb.append([InlineKeyboardButton(text=t(lang, "btn_refresh"), callback_data=f"d:{deal_id}"),
                InlineKeyboardButton(text=t(lang, "btn_all_deals"), callback_data="d:list")])

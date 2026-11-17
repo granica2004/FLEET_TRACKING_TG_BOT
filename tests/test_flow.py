@@ -757,6 +757,20 @@ def test_all_texts_translated():
         assert len(sets) == 1, key
 
 
+async def test_krasnodar_cmr_in_deal_card(app):
+    from src.bot.roles import deal_card
+    from src.db.database import get_session
+    deal = {"ID": "900", "TITLE": "Тест Краснодар", "STAGE_ID": "UC_SDO64X", "UF_CRM_1711445194523": "436"}
+    async with get_session() as session:
+        text_ru, kb_ru = await deal_card(session, deal, "ru")
+        text_en, kb_en = await deal_card(session, deal, "en")
+    assert "Краснодар" in text_ru and "Графа 13 CMR" in text_ru and "Лиц. 10309/070721/10150/7" in text_ru
+    assert "т/п Прикубанский - код 10309200" in text_ru
+    assert "Prikubansky Customs Post" in text_en and "Krasnodar" in text_en
+    copy = [b.copy_text.text for row in kb_ru.inline_keyboard for b in row if b.copy_text]
+    assert copy and copy[0].startswith('СВХ ООО "КТС", ИНН 2310157608')
+
+
 def test_bitrix_text_markup():
     from src.services.bitrix import Bitrix24Client
     out = Bitrix24Client.to_bitrix_text("📍 <b>Местоположение</b>\n🗺️ <a href='https://x.ru/?a=1'>Карта</a>\n⏱️ 2 ч")
