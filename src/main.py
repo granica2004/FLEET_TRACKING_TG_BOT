@@ -129,10 +129,6 @@ async def lifespan(app: FastAPI):
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted, using long polling")
     
-    # Координаты терминалов, у которых есть только адрес
-    from src.services.geocoder import fill_terminal_coords
-    await fill_terminal_coords()
-    
     # Запуск планировщика
     start_scheduler()
     logger.info("Scheduler started")

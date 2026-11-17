@@ -193,31 +193,6 @@ class GeocoderService:
             return None
 
 
-async def fill_terminal_coords():
-    """
-    Терминалам с адресом, но без координат — найти координаты по адресу (один раз при запуске).
-    Найденное пишется в лог: координаты стоит перенести в TERMINALS в config.py.
-    """
-    from src.config import TERMINALS
-    for tid, t in TERMINALS.items():
-        if t.get("lat") and t.get("lon"):
-            continue
-        address = t.get("address_ru") or t.get("address_en")
-        if not address:
-            continue
-        try:
-            coords = await maps_service.geocoder.geocode(address)
-        except Exception as e:
-            logger.warning(f"Terminal {tid} geocoding failed: {e}")
-            coords = None
-        if coords:
-            t["lat"], t["lon"] = coords
-            t["coords_auto"] = True
-            logger.info(f"TERMINAL_COORDS {tid} {t.get('code')}: lat={coords[0]:.6f} lon={coords[1]:.6f} ({address})")
-        else:
-            logger.warning(f"TERMINAL_COORDS {tid} {t.get('code')}: not found ({address})")
-
-
 class MapsService:
     """
     Сервис для работы с картами и маршрутами.
