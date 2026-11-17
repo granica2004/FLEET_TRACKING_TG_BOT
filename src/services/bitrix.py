@@ -343,6 +343,28 @@ class Bitrix24Client:
             "company_title": (company or {}).get("TITLE") or rows[0].get("RQ_COMPANY_NAME"),
         }
     
+    async def list_client_deals(self, company_id: Optional[int], contact_id: Optional[int],
+                                days: int = 120, limit: int = 25) -> List[Dict[str, Any]]:
+        """Сделки клиента: открытые + созданные за последние days дней, новые сверху."""
+        from datetime import timedelta
+        select = ["ID", "TITLE", "STAGE_ID", "CLOSED", "DATE_CREATE", "COMPANY_ID", "CONTACT_ID",
+                  settings.bitrix_field_truck_number, settings.bitrix_field_terminal]
+        since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
+        found: Dict[str, Dict[str, Any]] = {}
+        filters = []
+        for key, value in (("COMPANY_ID", company_id), ("CONTACT_ID", contact_id)):
+            if value:
+                filters.append({key: value, "CLOSED": "N"})
+                filters.append({key: value, ">=DATE_CREATE": since})
+        for flt in filters:
+            rows = await self._request("crm.deal.list", {
+                "filter": flt, "select": select, "order": {"DATE_CREATE": "DESC"},
+            })
+            for row in rows or []:
+                found.setdefault(str(row["ID"]), row)
+        deals = sorted(found.values(), key=lambda d: d.get("DATE_CREATE") or "", reverse=True)
+        return deals[:limit]
+    
     async def set_stage(self, deal_id: int, stage_id: str) -> bool:
         return await self.update_deal(deal_id, {"STAGE_ID": stage_id})
     

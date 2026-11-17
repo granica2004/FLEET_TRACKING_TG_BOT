@@ -462,3 +462,13 @@ async def get_trip_points(session: AsyncSession, trip: Trip) -> List[Location]:
         q = q.where(Location.recorded_at <= trip.completed_at)
     result = await session.execute(q.order_by(Location.recorded_at.asc()))
     return list(result.scalars().all())
+
+
+
+async def list_trips_by_deal(session: AsyncSession, deal_id: int, limit: int = 5) -> List[Trip]:
+    """Рейсы сделки: сначала активные, затем последние завершённые"""
+    result = await session.execute(
+        select(Trip).where(Trip.bitrix_deal_id == deal_id)
+        .order_by(Trip.status.asc(), Trip.started_at.desc()).limit(limit)
+    )
+    return list(result.scalars().all())

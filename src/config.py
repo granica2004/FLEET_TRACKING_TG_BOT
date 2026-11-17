@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     bitrix_field_driver_phone: str = Field("UF_CRM_1715753845", env="BITRIX_FIELD_DRIVER_PHONE")
     bitrix_field_telegram_id: str = Field("UF_CRM_66365540E721C", env="BITRIX_FIELD_TELEGRAM_ID")
     bitrix_field_telegram_group: str = Field("UF_CRM_A_T_GROUP_ID", env="BITRIX_FIELD_TELEGRAM_GROUP")
+    # Краткие комментарии менеджеров для клиента (список строк)
+    bitrix_field_client_comments: str = Field("UF_CRM_1714286328", env="BITRIX_FIELD_CLIENT_COMMENTS")
+    # Тема письма для переписки с клиентом
+    bitrix_field_email_subject: str = Field("UF_CRM_1711732900025", env="BITRIX_FIELD_EMAIL_SUBJECT")
     
     # Стадии сделки
     bitrix_stage_cargo_sent: str = Field("UC_SDO64X", env="BITRIX_STAGE_CARGO_SENT")

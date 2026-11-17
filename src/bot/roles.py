@@ -505,6 +505,8 @@ async def viewer_card(session, trip, lang: str = "ru"):
         url = access.track_url(trip.id)
         if url:
             kb.append([InlineKeyboardButton(text=t(lang, "btn_map"), url=url)])
+    if trip.bitrix_deal_id:
+        kb.append([InlineKeyboardButton(text=t(lang, "btn_deal"), callback_data=f"d:{trip.bitrix_deal_id}")])
     kb.append([InlineKeyboardButton(text=t(lang, "btn_refresh"), callback_data=f"v:t:{trip.id}"),
                InlineKeyboardButton(text=t(lang, "btn_all_trips"), callback_data="v:list")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
@@ -574,6 +576,180 @@ async def cb_history(cb: CallbackQuery, lang: str = "ru"):
     url = access.track_url(trip.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t(lang, "btn_map"), url=url)]]) if url else None
     await cb.message.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    await cb.answer()
+
+
+# ==================== МОИ СДЕЛКИ ====================
+
+async def _deals_for(session, user_id: int):
+    """[(deal_id, title, stage_id)] — клиенту из Битрикса по его компании/контакту, брокеру и админу — по рейсам."""
+    p = await access.get_participant(session, user_id)
+    if p and p.status == "active" and p.role == "client":
+        deals = await bitrix_client.list_client_deals(p.bitrix_company_id, p.bitrix_contact_id)
+        return [(int(d["ID"]), d.get("TITLE"), d.get("STAGE_ID")) for d in deals]
+    out, seen = [], set()
+    for tr in await access.trips_for_user(session, user_id):
+        if tr.bitrix_deal_id and tr.bitrix_deal_id not in seen:
+            seen.add(tr.bitrix_deal_id)
+            out.append((tr.bitrix_deal_id, tr.bitrix_deal_title, tr.bitrix_stage_id))
+    return out
+
+
+async def send_deal_list(message: Message, user_id: int, lang: str):
+    try:
+        async with get_session() as session:
+            deals = await _deals_for(session, user_id)
+    except Exception as e:
+        logger.error(f"Deal list failed for {user_id}: {e}")
+        await message.answer(t(lang, "deal_load_error"))
+        return
+    if not deals:
+        await message.answer(t(lang, "no_deals"))
+        return
+    kb = []
+    for deal_id, title, stage in deals:
+        label = f"#{deal_id} · {i18n.stage_name(lang, stage)} · {title or ''}"
+        kb.append([InlineKeyboardButton(text=label[:64], callback_data=f"d:{deal_id}")])
+    await message.answer(t(lang, "deals_header", n=len(deals)),
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+
+@router.message(F.text.in_(V("btn_my_deals")))
+async def my_deals(message: Message, state: FSMContext, lang: str = "ru"):
+    uid = message.from_user.id
+    if not access.is_admin(uid):
+        async with get_session() as session:
+            p = await access.get_participant(session, uid)
+        if not p or p.status != "active":
+            raise SkipHandler()
+    await state.clear()
+    await send_deal_list(message, uid, lang)
+
+
+async def can_view_deal(session, user_id: int, deal: dict) -> bool:
+    if access.is_admin(user_id):
+        return True
+    p = await access.get_participant(session, user_id)
+    if not p or p.status != "active":
+        return False
+    if p.role == "client":
+        company = str(deal.get("COMPANY_ID") or "")
+        contact = str(deal.get("CONTACT_ID") or "")
+        return bool((p.bitrix_company_id and company == str(p.bitrix_company_id)) or
+                    (p.bitrix_contact_id and contact == str(p.bitrix_contact_id)))
+    if p.role == "broker":
+        for tr in await crud.list_trips_by_deal(session, int(deal["ID"]), limit=20):
+            if await access.can_view(session, user_id, tr):
+                return True
+    return False
+
+
+def _bitrix_date(value) -> str:
+    from src.services.trips import _parse_dt
+    dt = _parse_dt(value)
+    return msk(dt, "%d.%m.%Y") if dt else ""
+
+
+def _driver_phone(value) -> Optional[str]:
+    text = str(value or "").strip()
+    return text if sum(ch.isdigit() for ch in text) >= 7 else None
+
+
+async def deal_card(session, deal: dict, lang: str):
+    from aiogram.types import CopyTextButton
+    deal_id = int(deal["ID"])
+    lines = [f"📋 <b>#{deal_id} {escape(deal.get('TITLE') or '')}</b>",
+             t(lang, "deal_stage", stage=escape(i18n.stage_name(lang, deal.get("STAGE_ID"))))]
+    terminal = deal.get(settings.bitrix_field_terminal)
+    if terminal:
+        lines.append(t(lang, "deal_terminal", terminal=escape(i18n.terminal_name(lang, terminal))))
+        addr = i18n.terminal_address(lang, terminal)
+        if addr:
+            lines.append(f"     {escape(addr)}")
+    truck = deal.get(settings.bitrix_field_truck_number) or deal.get(settings.bitrix_field_truck_number_alt)
+    if truck:
+        lines.append(t(lang, "deal_vehicle", truck=escape(str(truck))))
+    for key, field in (("deal_shipped", settings.bitrix_field_shipment_date),
+                       ("deal_planned", settings.bitrix_field_planned_arrival),
+                       ("deal_arrived", settings.bitrix_field_actual_arrival)):
+        d = _bitrix_date(deal.get(field))
+        if d:
+            lines.append(t(lang, key, d=d))
+
+    # Водитель: из рейсов бота по этой сделке
+    kb = []
+    trips = await crud.list_trips_by_deal(session, deal_id)
+    lines.append(t(lang, "deal_drivers"))
+    shown = 0
+    for tr in trips:
+        driver = await crud.get_driver_by_id(session, tr.driver_id) if tr.driver_id else None
+        if not driver:
+            continue
+        loc = await crud.get_last_trip_location(session, tr)
+        name = escape(" ".join(x for x in [driver.first_name, driver.last_name] if x) or t(lang, "driver_word"))
+        contact = f" (@{escape(driver.username)})" if driver.username else ""
+        seen = i18n.ago(lang, loc.recorded_at) if loc else t(lang, "no_points_short")
+        mark = "🟢 " if tr.status == "active" else "⚪ "
+        lines.append(mark + t(lang, "deal_driver_line", name=name, contact=contact, truck=escape(tr.truck_number),
+                              seen=seen))
+        row = [InlineKeyboardButton(text=f"{t(lang, 'btn_open_trip')} {tr.truck_number}"[:40],
+                                    callback_data=f"v:t:{tr.id}")]
+        if driver.username and shown == 0:
+            row.append(InlineKeyboardButton(text=t(lang, "btn_driver_chat")[:40], url=f"https://t.me/{driver.username}"))
+        kb.append(row)
+        shown += 1
+    phone = _driver_phone(deal.get(settings.bitrix_field_driver_phone))
+    if phone:
+        lines.append(t(lang, "deal_driver_phone", phone=escape(phone)))
+    if not shown and not phone:
+        lines.append(t(lang, "deal_no_driver"))
+
+    # Комментарии менеджера
+    comments = deal.get(settings.bitrix_field_client_comments)
+    if isinstance(comments, list):
+        comments = "\n".join(str(x) for x in comments if x)
+    comments = (comments or "").replace("\r", "").strip()
+    if comments:
+        lines.append(t(lang, "deal_comments", text=escape(comments[:1500])))
+
+    # Тема письма
+    subject = (deal.get(settings.bitrix_field_email_subject) or "").strip()
+    if subject:
+        lines.append(t(lang, "deal_subject", subject=escape(subject)))
+        kb.insert(0, [InlineKeyboardButton(text=t(lang, "btn_copy_subject"),
+                                           copy_text=CopyTextButton(text=subject[:256]))])
+
+    kb.append([InlineKeyboardButton(text=t(lang, "btn_refresh"), callback_data=f"d:{deal_id}"),
+               InlineKeyboardButton(text=t(lang, "btn_all_deals"), callback_data="d:list")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@router.callback_query(F.data == "d:list")
+async def cb_deal_list(cb: CallbackQuery, lang: str = "ru"):
+    await send_deal_list(cb.message, cb.from_user.id, lang)
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^d:\d+$"))
+async def cb_deal(cb: CallbackQuery, lang: str = "ru"):
+    deal_id = int(cb.data.split(":")[1])
+    try:
+        deal = await bitrix_client.get_deal(deal_id)
+    except Exception as e:
+        logger.error(f"Cannot load deal {deal_id}: {e}")
+        deal = None
+    if not deal or not deal.get("ID"):
+        await cb.answer(t(lang, "deal_load_error"), show_alert=True)
+        return
+    async with get_session() as session:
+        if not await can_view_deal(session, cb.from_user.id, deal):
+            await cb.answer(t(lang, "no_access_deal"), show_alert=True)
+            return
+        text, kb = await deal_card(session, deal, lang)
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     await cb.answer()
 
 

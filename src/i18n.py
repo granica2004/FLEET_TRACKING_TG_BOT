@@ -1,5 +1,6 @@
 """
-Переводы интерфейса водителя, клиента и брокера: ru, en, uz (узбекский, латиница).
+Переводы интерфейса водителя, клиента и брокера: ru, en, uz (узбекский, латиница), fa (фарси).
+Тексты на фарси и тексты сделок — в src/i18n_extra.py.
 Админка и комментарии в Битриксе — только на русском.
 
 t(lang, key, **kw) — текст; V(key) — все варианты кнопки (для фильтров по тексту).
@@ -8,9 +9,9 @@ t(lang, key, **kw) — текст; V(key) — все варианты кнопк
 
 from typing import Dict, Optional, Set
 
-LANGS = ("ru", "en", "uz")
+LANGS = ("ru", "en", "uz", "fa")
 DEFAULT = "ru"
-LANG_NAMES = {"ru": "🇷🇺 Русский", "en": "🇬🇧 English", "uz": "🇺🇿 O'zbekcha"}
+LANG_NAMES = {"ru": "🇷🇺 Русский", "en": "🇬🇧 English", "uz": "🇺🇿 O'zbekcha", "fa": "🇮🇷 فارسی"}
 
 T: Dict[str, Dict[str, str]] = {
     # ---------- общее ----------
@@ -607,6 +608,15 @@ T: Dict[str, Dict[str, str]] = {
     "cmd_help": {"ru": "❓ Справка", "en": "❓ Help", "uz": "❓ Yordam"},
 }
 
+from src.i18n_extra import DEAL_KEYS, FA, FA_COUNTRIES, STAGES  # noqa: E402
+
+for _key, _text in FA.items():
+    T[_key]["fa"] = _text
+T.update(DEAL_KEYS)
+for _key in T:
+    T[_key].setdefault("fa", T[_key]["en"])  # страховка: новый ключ без перевода — по-английски
+T["lang_choose"] = {code: FA["lang_choose"] for code in ("ru", "en", "uz", "fa")}
+
 COUNTRIES = {
     "ru": {"ru": "Россия", "kz": "Казахстан", "uz": "Узбекистан", "tj": "Таджикистан", "kg": "Кыргызстан",
            "tm": "Туркменистан", "ir": "Иран", "az": "Азербайджан", "ge": "Грузия", "am": "Армения",
@@ -617,6 +627,7 @@ COUNTRIES = {
     "uz": {"ru": "Rossiya", "kz": "Qozog'iston", "uz": "O'zbekiston", "tj": "Tojikiston", "kg": "Qirg'iziston",
            "tm": "Turkmaniston", "ir": "Eron", "az": "Ozarbayjon", "ge": "Gruziya", "am": "Armaniston",
            "by": "Belarus", "cn": "Xitoy", "tr": "Turkiya", "af": "Afg'oniston", "mn": "Mo'g'uliston"},
+    "fa": FA_COUNTRIES,
 }
 
 
@@ -639,9 +650,18 @@ def guess(language_code: Optional[str]) -> str:
     code = (language_code or "").lower()[:2]
     if code == "uz":
         return "uz"
+    if code == "fa":
+        return "fa"
     if code in ("ru", "uk", "be", "kk", "ky", "tg", ""):
         return "ru"
     return "en"
+
+
+def stage_name(lang: str, stage_id: Optional[str]) -> str:
+    entry = STAGES.get(str(stage_id or ""))
+    if not entry:
+        return "—"
+    return entry.get(norm(lang)) or entry["ru"]
 
 
 def country(lang: str, code: Optional[str]) -> str:

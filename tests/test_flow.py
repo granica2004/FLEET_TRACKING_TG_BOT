@@ -84,7 +84,8 @@ class FakeSession(BaseSession):
                 rows = getattr(m.reply_markup, "inline_keyboard", None) or []
                 for row in rows:
                     for b in row:
-                        out.append(f"{b.text}|{b.callback_data or b.url}")
+                        extra = b.callback_data or b.url or (b.copy_text.text if b.copy_text else None)
+                        out.append(f"{b.text}|{extra}")
         return out
 
     def alerts(self):
@@ -97,6 +98,9 @@ class FakeSession(BaseSession):
 DEAL_100 = {
     "ID": "100", "TITLE": "Курага ООО Ромашка", "STAGE_ID": "UC_SDO64X", "CLOSED": "N",
     "COMPANY_ID": "50", "CONTACT_ID": "25726",
+    "UF_CRM_1714286328": ["- контракт\r\n- унк\r\n- этикетки"],
+    "UF_CRM_1711732900025": "Документы на проверку // #100 курага Ромашка 01A123BC",
+    "UF_CRM_1715753845": "нет",
     "UF_CRM_1586456781744": "01A123BC", "UF_CRM_1711445194523": "86",
     "UF_CRM_1713519647288": "2026-11-05T03:00:00+03:00",
 }
@@ -169,6 +173,9 @@ async def app(env):
     async def find_inn(inn):
         return {"company_id": 50, "company_title": "СОГДИАНА"} if inn == "7726605312" else None
 
+    async def client_deals(company_id, contact_id, days=120, limit=25):
+        return [deals["100"]] if company_id == 50 else []
+
     async def set_stage(deal_id, stage):
         bx["stages"].append((deal_id, stage))
         return True
@@ -188,6 +195,7 @@ async def app(env):
     bitrix_client.find_client_by_phone = find_client
     bitrix_client.find_company_by_inn = find_inn
     bitrix_client.set_stage = set_stage
+    bitrix_client.list_client_deals = client_deals
     bitrix_client.update_deal = update_deal
     maps_service.get_distance_to_terminal = dist
 
@@ -693,6 +701,60 @@ async def test_english_client_gets_events(app):
     await location(app, DRIVER1, 51.5, 55.1)
     assert "The truck has entered Russia" in joined(s.sent_to(EN_CLIENT))
     assert "въехала в Россию" in joined(s.sent_to(CLIENT))
+
+
+FA_DRIVER = 6003
+
+
+async def test_client_deals_card(app):
+    s = app["s"]
+    s.clear()
+    await text(app, CLIENT, "📋 Мои сделки")
+    assert any("d:100" in k for k in s.kb_texts(CLIENT))
+    s.clear()
+    await press(app, CLIENT, "d:100")
+    card = joined(s.sent_to(CLIENT))
+    assert "груз в пути" in card and "Коломна" in card
+    assert "Комментарии менеджера" in card and "этикетки" in card
+    assert "<code>Документы на проверку // #100" in card
+    assert "User2001" in card and "@u2001" in card
+    keys = s.kb_texts(CLIENT)
+    assert any(k.startswith("📋 Скопировать тему письма|Документы на проверку") for k in keys)
+    assert any("https://t.me/u2001" in k for k in keys)
+    trip = await _trip100()
+    s.clear()
+    await press(app, CLIENT, f"v:t:{trip.id}")
+    assert any("d:100" in k for k in s.kb_texts(CLIENT))  # из карточки рейса — в сделку
+    # брокер, которому рейс открыт, видит сделку; другой брокер — нет
+    s.clear()
+    await press(app, BROKER, "d:100")
+    assert "Комментарии менеджера" in joined(s.sent_to(BROKER))
+    await press(app, BROKER2, "d:100")
+    assert "Нет доступа к этой сделке" in s.alerts()
+
+
+async def test_persian_driver(app):
+    s = app["s"]
+    await text(app, FA_DRIVER, "/start")
+    await press(app, FA_DRIVER, "lang:fa")
+    assert "شما چه کسی هستید" in joined(s.sent_to(FA_DRIVER))
+    await text(app, FA_DRIVER, "🚛 من راننده هستم")
+    s.clear()
+    await text(app, FA_DRIVER, "✅ با ارسال موقعیت مکانی موافقم")
+    assert "شماره کشنده" in joined(s.sent_to(FA_DRIVER))
+    await text(app, FA_DRIVER, "22IR222")
+    s.clear()
+    await location(app, FA_DRIVER)
+    assert "موقعیت ذخیره شد" in joined(s.sent_to(FA_DRIVER))
+
+
+def test_all_texts_translated():
+    import re as _re
+    from src.i18n import LANGS, T
+    for key, entry in T.items():
+        assert all(entry.get(lang) for lang in LANGS), key
+        sets = {frozenset(_re.findall(r"{(\w+)}", entry[lang])) for lang in LANGS}
+        assert len(sets) == 1, key
 
 
 def test_bitrix_text_markup():

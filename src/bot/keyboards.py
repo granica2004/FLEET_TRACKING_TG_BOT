@@ -115,7 +115,7 @@ def skip_keyboard(lang: str = "ru") -> ReplyKeyboardMarkup:
 
 def client_menu(lang: str = "ru") -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=t(lang, "btn_my_trips"))],
+        keyboard=[[KeyboardButton(text=t(lang, "btn_my_deals")), KeyboardButton(text=t(lang, "btn_my_trips"))],
                   [KeyboardButton(text=t(lang, "btn_write_dispatcher"))]],
         resize_keyboard=True,
     )
@@ -125,7 +125,7 @@ def broker_menu(lang: str = "ru") -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=t(lang, "btn_my_trips")), KeyboardButton(text=t(lang, "btn_create_trip"))],
-            [KeyboardButton(text=t(lang, "btn_write_dispatcher"))],
+            [KeyboardButton(text=t(lang, "btn_my_deals")), KeyboardButton(text=t(lang, "btn_write_dispatcher"))],
         ],
         resize_keyboard=True,
     )
