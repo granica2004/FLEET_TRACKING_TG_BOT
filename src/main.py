@@ -26,6 +26,7 @@ from src.bot.admin import router as admin_router
 from src.bot.roles import router as roles_router
 from src.bot.lang_mw import LangMiddleware
 from src.services.access import reload_admins
+from src.services.webhook_bind import bind_webhook, reassert_webhook
 from src.db.database import get_session
 
 # Конфигурация
@@ -119,11 +120,15 @@ async def lifespan(app: FastAPI):
     # Установка команд бота (меню)
     await setup_bot_commands(bot)
     
-    # Настройка webhook (если указан URL)
+    # Настройка webhook (если указан URL).
+    # При остановке вебхук НЕ снимаем: новый контейнер уже работает,
+    # а deleteWebhook здесь стирал его привязку — бот переставал получать команды.
+    webhook_task = None
     if settings.telegram_webhook_url:
-        webhook_url = f"{settings.telegram_webhook_url.rstrip('/')}/webhook/telegram"
-        await bot.set_webhook(webhook_url)
-        logger.info(f"Webhook set: {webhook_url}")
+        await bind_webhook(bot, settings.telegram_webhook_url)
+        webhook_task = asyncio.create_task(
+            reassert_webhook(bot, settings.telegram_webhook_url)
+        )
     else:
         # Long polling режим (для разработки)
         await bot.delete_webhook(drop_pending_updates=True)
@@ -141,9 +146,8 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application...")
     
     stop_scheduler()
-    
-    if settings.telegram_webhook_url:
-        await bot.delete_webhook()
+    if webhook_task is not None:
+        webhook_task.cancel()
     
     await bot.session.close()
     await close_db()
